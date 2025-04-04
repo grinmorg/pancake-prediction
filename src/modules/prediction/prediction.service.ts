@@ -20,6 +20,13 @@ interface Round {
   canBet: boolean;
 }
 
+interface BetHistory {
+  epoch: number;
+  position: 'Bull' | 'Bear';
+  amount: bigint;
+  claimed: boolean;
+}
+
 @Injectable()
 export class PredictionService implements OnModuleInit {
   private readonly logger = new Logger(PredictionService.name);
@@ -30,6 +37,8 @@ export class PredictionService implements OnModuleInit {
   private baseBetAmount: bigint;
   private lastBetPosition: 'Bull' | 'Bear' | null = null;
   private lastBetEpoch: number | null = null;
+  private betHistory: BetHistory[] = [];
+  private readonly WIN_STREAK_TO_CLAIM = 3;
 
   constructor(
     private readonly config: ConfigService,
@@ -94,11 +103,12 @@ export class PredictionService implements OnModuleInit {
     });
 
     this.contract.on('EndRound', async (epoch) => {
-      if (this.lastBetEpoch === Number(epoch)) {
-        const round = await this.getRoundData(Number(epoch));
-        const isWin = this.checkBetResult(round);
-        await this.handleRoundResult(Number(epoch), isWin);
-        this.resetBetState();
+      const betsForRound = this.betHistory.filter(
+        (b) => b.epoch === Number(epoch),
+      );
+      if (betsForRound.length > 0) {
+        await this.handleRoundResult(Number(epoch));
+        await this.checkAndClaimWinnings();
       }
     });
 
@@ -108,61 +118,91 @@ export class PredictionService implements OnModuleInit {
     });
   }
 
-  private async handleRoundResult(epoch: number, isWin: boolean) {
-    if (isWin) {
+  private async handleRoundResult(epoch: number) {
+    const round = await this.getRoundData(epoch);
+    const betsForRound = this.betHistory.filter((b) => b.epoch === epoch);
+
+    if (betsForRound.length === 0) return;
+
+    const anyWin = betsForRound.some((bet) =>
+      this.checkSingleBetResult(bet, round),
+    );
+
+    if (anyWin) {
       this.currentBetAmount = this.baseBetAmount;
-      await this.claimWinnings(epoch);
       this.sendTelegramMessage(
         `✅ Won round #${epoch}! Reset to ${ethers.formatEther(this.baseBetAmount)} BNB`,
       );
     } else {
-      this.currentBetAmount *= BigInt(2.5);
+      this.currentBetAmount = (this.currentBetAmount * 25n) / 10n;
       this.sendTelegramMessage(
         `❌ Lost round #${epoch}. Next bet: ${ethers.formatEther(this.currentBetAmount)} BNB`,
       );
     }
   }
 
-  private resetBetState() {
-    this.lastBetEpoch = null;
-    this.lastBetPosition = null;
-  }
+  private async checkAndClaimWinnings() {
+    if (this.betHistory.length < this.WIN_STREAK_TO_CLAIM) return;
 
-  private async claimWinnings(epoch: number) {
-    try {
-      const tx = await this.contract.claim([epoch - 1]);
-      this.sendTelegramMessage(
-        `🏆 Claimed rewards for round #${epoch} | Tx: ${tx.hash}`,
-      );
-      await tx.wait();
-    } catch (error) {
-      this.sendTelegramMessage(
-        `⚠️ Failed to claim rewards: ${error.reason || error.message}`,
-      );
+    // Находим последние 3 не заклеймленные ставки
+    const unclaimedBets = this.betHistory.filter((b) => !b.claimed);
+    if (unclaimedBets.length < this.WIN_STREAK_TO_CLAIM) return;
+
+    // Берем последние 3 ставки
+    const lastThreeBets = unclaimedBets.slice(-this.WIN_STREAK_TO_CLAIM);
+
+    // Проверяем, что все 3 выиграли
+    const rounds = await Promise.all(
+      lastThreeBets.map((bet) => this.getRoundData(bet.epoch)),
+    );
+
+    const allWon = lastThreeBets.every((bet, index) =>
+      this.checkSingleBetResult(bet, rounds[index]),
+    );
+
+    if (allWon) {
+      const epochsToClaim = lastThreeBets.map((bet) => bet.epoch);
+      try {
+        const tx = await this.contract.claim(epochsToClaim);
+        await tx.wait();
+
+        // Помечаем ставки как заклеймленные
+        lastThreeBets.forEach((bet) => {
+          const betToUpdate = this.betHistory.find(
+            (b) => b.epoch === bet.epoch && b.position === bet.position,
+          );
+          if (betToUpdate) betToUpdate.claimed = true;
+        });
+
+        this.sendTelegramMessage(
+          `🏆 Claimed rewards for rounds: ${epochsToClaim.join(', ')} | Tx: ${tx.hash}`,
+        );
+      } catch (error) {
+        this.sendTelegramMessage(
+          `⚠️ Failed to claim rewards: ${error.reason || error.message}`,
+        );
+      }
     }
   }
 
-  private checkBetResult(round: Round): boolean {
-    if (!this.lastBetPosition || !round.oracleCalled) return false;
+  private checkSingleBetResult(bet: BetHistory, round: Round): boolean {
+    if (!round.oracleCalled) return false;
 
     return (
-      (this.lastBetPosition === 'Bull' && round.closePrice > round.lockPrice) ||
-      (this.lastBetPosition === 'Bear' && round.closePrice < round.lockPrice)
+      (bet.position === 'Bull' && round.closePrice > round.lockPrice) ||
+      (bet.position === 'Bear' && round.closePrice < round.lockPrice)
     );
   }
 
   private async startBettingStrategy() {
     setInterval(async () => {
       try {
-        // Получаем текущий и следующий раунды
         const currentEpoch = Number(await this.contract.currentEpoch());
         const nextEpoch = currentEpoch + 1;
 
-        // Получаем данные для обоих раундов
         const currentRound = await this.getRoundData(currentEpoch);
         const nextRound = await this.getRoundData(nextEpoch);
 
-        // Определяем активный раунд для ставок
         const bettingRound = this.isRoundBettable(nextRound)
           ? nextRound
           : currentRound;
@@ -189,12 +229,16 @@ export class PredictionService implements OnModuleInit {
 
   private isBettable(round: Round): boolean {
     const now = Math.floor(Date.now() / 1000);
-    // Делаем ставку за 5 секунд до закрытия приема
     return (
       now >= round.lockTimestamp - 5 &&
       now < round.lockTimestamp &&
-      this.isRoundBettable(round)
+      this.isRoundBettable(round) &&
+      !this.hasExistingBet(round.epoch)
     );
+  }
+
+  private hasExistingBet(epoch: number): boolean {
+    return this.betHistory.some((b) => b.epoch === epoch && !b.claimed);
   }
 
   private async getRoundData(epoch: number): Promise<Round> {
@@ -266,7 +310,6 @@ export class PredictionService implements OnModuleInit {
 
       const method = position === 'Bull' ? 'betBull' : 'betBear';
 
-      // Получаем актуальные параметры газа
       const [gasEstimate, nonce] = await Promise.all([
         this.contract[method].estimateGas(epoch, { value: betAmount }),
         this.provider.getTransactionCount(this.wallet.address, 'latest'),
@@ -274,20 +317,26 @@ export class PredictionService implements OnModuleInit {
 
       const tx = await this.contract[method](epoch, {
         value: betAmount,
-        gasLimit: (gasEstimate * 120n) / 100n, // +20% buffer
+        gasLimit: (gasEstimate * 120n) / 100n,
         nonce: nonce,
       });
 
-      // Блокируем повторные ставки
+      this.betHistory.push({
+        epoch,
+        position,
+        amount: betAmount,
+        claimed: false,
+      });
+
       this.lastBetPosition = position;
       this.lastBetEpoch = epoch;
 
-      // Ждем 1 подтверждение
       await tx.wait(1);
-
       this.sendTelegramMessage(
         `🎲 Bet ${ethers.formatEther(betAmount)} BNB on ${position} (#${epoch}) | Tx: ${tx.hash}`,
       );
+
+      this.cleanupBetHistory();
     } catch (error) {
       this.resetBetState();
       this.logger.error('Bet failed', error);
@@ -295,6 +344,17 @@ export class PredictionService implements OnModuleInit {
         `⚠️ Bet error: ${error.reason || error.message}`,
       );
     }
+  }
+
+  private cleanupBetHistory() {
+    if (this.betHistory.length > 50) {
+      this.betHistory = this.betHistory.slice(-50);
+    }
+  }
+
+  private resetBetState() {
+    this.lastBetEpoch = null;
+    this.lastBetPosition = null;
   }
 
   private sendTelegramMessage(message: string) {
