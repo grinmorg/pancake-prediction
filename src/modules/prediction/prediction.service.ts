@@ -17,6 +17,7 @@ interface Round {
   bullAmount: bigint;
   bearAmount: bigint;
   oracleCalled: boolean;
+  canBet: boolean;
 }
 
 @Injectable()
@@ -115,7 +116,7 @@ export class PredictionService implements OnModuleInit {
         `✅ Won round #${epoch}! Reset to ${ethers.formatEther(this.baseBetAmount)} BNB`,
       );
     } else {
-      this.currentBetAmount *= 2n;
+      this.currentBetAmount *= BigInt(2.5);
       this.sendTelegramMessage(
         `❌ Lost round #${epoch}. Next bet: ${ethers.formatEther(this.currentBetAmount)} BNB`,
       );
@@ -155,6 +156,11 @@ export class PredictionService implements OnModuleInit {
       try {
         const currentEpoch = Number(await this.contract.currentEpoch());
         const round = await this.getRoundData(currentEpoch);
+        const now = Math.floor(Date.now() / 1000);
+
+        this.logger.debug(
+          `Checking round #${currentEpoch} | Now: ${now} | Lock: ${round.lockTimestamp} | Remaining: ${round.lockTimestamp - now}s`,
+        );
 
         if (this.isBettable(round)) {
           await this.placeBet(currentEpoch);
@@ -164,12 +170,17 @@ export class PredictionService implements OnModuleInit {
           `❌ Strategy error: ${error.reason || error.message}`,
         );
       }
-    }, 30_000);
+    }, 1_000); // Проверяем каждую секунду
   }
 
   private isBettable(round: Round): boolean {
     const now = Math.floor(Date.now() / 1000);
-    return now > round.startTimestamp && now < round.lockTimestamp - 5;
+
+    return (
+      !round.oracleCalled && // Раунд еще не закрыт
+      now >= round.lockTimestamp - 5 && // За 5 секунд до блокировки
+      now < round.lockTimestamp // Еще не заблокирован
+    );
   }
 
   private async getRoundData(epoch: number): Promise<Round> {
@@ -185,6 +196,7 @@ export class PredictionService implements OnModuleInit {
       bullAmount: BigInt(roundData.bullAmount),
       bearAmount: BigInt(roundData.bearAmount),
       oracleCalled: roundData.oracleCalled,
+      canBet: roundData[11], // Индекс поля canBet в ABI
     };
   }
 
@@ -233,12 +245,32 @@ export class PredictionService implements OnModuleInit {
     betAmount: bigint,
   ) {
     try {
+      // Добавляем проверку на возможность ставки
+      const round = await this.getRoundData(epoch);
+      if (!round.canBet) {
+        this.logger.debug(`Betting not allowed for epoch ${epoch}`);
+        return;
+      }
+
       const method = position === 'Bull' ? 'betBull' : 'betBear';
-      const tx = await this.contract[method](epoch, {
+
+      // Увеличиваем газ и устанавливаем правильный gasPrice
+      const gasEstimate = await this.contract[method].estimateGas(epoch, {
         value: betAmount,
-        gasLimit: 300000, // Устанавливаем лимит газа явно
       });
 
+      const nonce = await this.provider.getTransactionCount(
+        this.wallet.address,
+        'latest',
+      );
+
+      const tx = await this.contract[method](epoch, {
+        value: betAmount,
+        gasLimit: gasEstimate, // Запас газа
+        nonce,
+      });
+
+      // Блокируем повторные ставки сразу после успешной отправки
       this.lastBetPosition = position;
       this.lastBetEpoch = epoch;
 
@@ -251,6 +283,8 @@ export class PredictionService implements OnModuleInit {
         throw new Error('Transaction reverted');
       }
     } catch (error) {
+      // Сбрасываем состояние при ошибке
+      this.resetBetState();
       this.sendTelegramMessage(
         `⚠️ Failed to place bet: ${error.reason || error.message}`,
       );
