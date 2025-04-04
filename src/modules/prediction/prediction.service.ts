@@ -1,12 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  createPublicClient,
-  createWalletClient,
-  getContract,
-  http,
-} from 'viem';
-import { bsc } from 'viem/chains';
+import { ethers } from 'ethers';
 import { TelegramService } from '../telegram-bot/telegram.service';
 import { predictionAbi } from './pancake-prediction-abi';
 
@@ -26,115 +20,123 @@ interface Round {
 }
 
 @Injectable()
-export class PredictionService {
-  private publicClient: any;
-  private walletClient: any;
-  private contract: any;
-  private receiverTgId: string;
-
+export class PredictionService implements OnModuleInit {
+  private readonly logger = new Logger(PredictionService.name);
+  private provider: ethers.JsonRpcProvider;
+  private wallet: ethers.Wallet;
+  private contract: ethers.Contract;
   private currentBetAmount: bigint;
+  private baseBetAmount: bigint;
   private lastBetPosition: 'Bull' | 'Bear' | null = null;
   private lastBetEpoch: number | null = null;
-  private baseBetAmount: bigint;
 
   constructor(
     private readonly config: ConfigService,
     private readonly telegramService: TelegramService,
-  ) {
-    const chain = bsc;
-
-    this.publicClient = createPublicClient({
-      chain,
-      transport: http(),
-    });
-
-    this.walletClient = createWalletClient({
-      chain,
-      transport: http(),
-      key: this.config.get('WALLET_PRIVATE_KEY'),
-    });
-
-    this.contract = getContract({
-      address: CONTRACT_ADDRESS,
-      abi: predictionAbi,
-      client: this.publicClient,
-    });
-
-    this.receiverTgId = this.config.get('RECIVER_TELEGRAM_ID');
-  }
+  ) {}
 
   async onModuleInit() {
-    this.baseBetAmount = await this.contract.read.minBetAmount();
-    this.currentBetAmount = this.baseBetAmount;
+    await this.initializeProvider();
+    await this.initializeContract();
     this.listenToEvents();
     this.startBettingStrategy();
   }
 
+  private async initializeProvider() {
+    try {
+      const privateKey = this.config.get<string>('WALLET_PRIVATE_KEY');
+      if (!privateKey?.startsWith('0x')) {
+        throw new Error('Invalid private key format. Must start with 0x');
+      }
+
+      this.provider = new ethers.JsonRpcProvider(
+        this.config.get('BSC_RPC_URL') || 'https://bsc-dataseed.binance.org/',
+        {
+          name: 'binance',
+          chainId: 56,
+        },
+      );
+
+      this.wallet = new ethers.Wallet(privateKey, this.provider);
+
+      this.logger.log(`Connected to BSC network`);
+      this.logger.log(`Operator address: ${this.wallet.address}`);
+      this.logger.log(
+        `Balance: ${ethers.formatEther(await this.provider.getBalance(this.wallet.address))} BNB`,
+      );
+    } catch (error) {
+      this.logger.error('Provider initialization failed', error.stack);
+      throw error;
+    }
+  }
+
+  private async initializeContract() {
+    this.contract = new ethers.Contract(
+      CONTRACT_ADDRESS,
+      predictionAbi,
+      this.wallet,
+    );
+
+    this.baseBetAmount = await this.contract.minBetAmount();
+    this.currentBetAmount = this.baseBetAmount;
+    this.logger.log(
+      `Min bet amount: ${ethers.formatEther(this.baseBetAmount)} BNB`,
+    );
+  }
+
   private listenToEvents() {
-    this.contract.watchEvent.LockRound(
-      {},
-      {
-        onLogs: (logs) => {
-          logs.forEach((log) => {
-            const message = `🔒 Round #${log.args.epoch} locked at price ${log.args.price}`;
-            this.telegramService.sendMessage(this.receiverTgId, message);
-          });
-        },
-      },
-    );
+    this.contract.on('LockRound', (epoch, price) => {
+      this.telegramService.sendMessage(
+        this.config.get('RECEIVER_TELEGRAM_ID'),
+        `🔒 Round #${epoch} locked at ${this.formatPrice(price)}`,
+      );
+    });
 
-    this.contract.watchEvent.EndRound(
-      {},
-      {
-        onLogs: (logs) => {
-          logs.forEach(async (log) => {
-            const epoch = Number(log.args.epoch);
-            if (this.lastBetEpoch === epoch) {
-              const round = await this.getRoundData(epoch);
-              const isWin = this.checkBetResult(round);
+    this.contract.on('EndRound', async (epoch) => {
+      if (this.lastBetEpoch === Number(epoch)) {
+        const round = await this.getRoundData(Number(epoch));
+        const isWin = this.checkBetResult(round);
+        await this.handleRoundResult(Number(epoch), isWin);
+        this.resetBetState();
+      }
+    });
 
-              if (isWin) {
-                this.currentBetAmount = this.baseBetAmount;
-                await this.claimWinnings(epoch);
-                this.telegramService.sendMessage(
-                  this.receiverTgId,
-                  `✅ Won round #${epoch}! Reset bet to ${this.formatBnb(this.baseBetAmount)} BNB`,
-                );
-              } else {
-                this.currentBetAmount = (this.currentBetAmount * 200n) / 100n; // x2
-                this.telegramService.sendMessage(
-                  this.receiverTgId,
-                  `❌ Lost round #${epoch}. Next bet: ${this.formatBnb(this.currentBetAmount)} BNB`,
-                );
-              }
+    this.provider.on('error', (error) => {
+      this.logger.error('Provider error:', error);
+      this.sendTelegramMessage(`⚠️ Provider error: ${error.message}`);
+    });
+  }
 
-              this.lastBetEpoch = null;
-              this.lastBetPosition = null;
-            }
-          });
-        },
-      },
-    );
+  private async handleRoundResult(epoch: number, isWin: boolean) {
+    if (isWin) {
+      this.currentBetAmount = this.baseBetAmount;
+      await this.claimWinnings(epoch);
+      this.sendTelegramMessage(
+        `✅ Won round #${epoch}! Reset to ${ethers.formatEther(this.baseBetAmount)} BNB`,
+      );
+    } else {
+      this.currentBetAmount *= 2n;
+      this.sendTelegramMessage(
+        `❌ Lost round #${epoch}. Next bet: ${ethers.formatEther(this.currentBetAmount)} BNB`,
+      );
+    }
+  }
+
+  private resetBetState() {
+    this.lastBetEpoch = null;
+    this.lastBetPosition = null;
   }
 
   private async claimWinnings(epoch: number) {
     try {
-      const { request } = await this.publicClient.simulateContract({
-        ...this.contract,
-        functionName: 'claim',
-        args: [[epoch]],
-        account: this.walletClient.account.address,
-      });
-
-      const txHash = await this.walletClient.writeContract(request);
-      this.telegramService.sendMessage(
-        this.receiverTgId,
-        `🏆 Claimed rewards for round #${epoch} | Tx: ${txHash}`,
+      const tx = await this.contract.claim([epoch]);
+      this.sendTelegramMessage(
+        `🏆 Claimed rewards for round #${epoch} | Tx: ${tx.hash}`,
       );
-    } catch (err) {
-      this.telegramService.sendMessage(
-        this.receiverTgId,
-        `⚠️ Failed to claim rewards: ${err.message}`,
+      await tx.wait();
+    } catch (error) {
+      this.sendTelegramMessage(
+        `⚠️ Failed to claim rewards: ${error.reason || error.message}`,
       );
     }
   }
@@ -142,28 +144,24 @@ export class PredictionService {
   private checkBetResult(round: Round): boolean {
     if (!this.lastBetPosition || !round.oracleCalled) return false;
 
-    const isBullWin = round.closePrice > round.lockPrice;
-    const isBearWin = round.closePrice < round.lockPrice;
-
     return (
-      (this.lastBetPosition === 'Bull' && isBullWin) ||
-      (this.lastBetPosition === 'Bear' && isBearWin)
+      (this.lastBetPosition === 'Bull' && round.closePrice > round.lockPrice) ||
+      (this.lastBetPosition === 'Bear' && round.closePrice < round.lockPrice)
     );
   }
 
   private async startBettingStrategy() {
     setInterval(async () => {
       try {
-        const currentEpoch = Number(await this.contract.read.currentEpoch());
+        const currentEpoch = Number(await this.contract.currentEpoch());
         const round = await this.getRoundData(currentEpoch);
 
         if (this.isBettable(round)) {
           await this.placeBet(currentEpoch);
         }
-      } catch (err) {
-        this.telegramService.sendMessage(
-          this.receiverTgId,
-          `❌ Error: ${err.message}`,
+      } catch (error) {
+        this.sendTelegramMessage(
+          `❌ Strategy error: ${error.reason || error.message}`,
         );
       }
     }, 30_000);
@@ -175,25 +173,34 @@ export class PredictionService {
   }
 
   private async getRoundData(epoch: number): Promise<Round> {
-    const roundData = await this.contract.read.rounds([BigInt(epoch)]);
-
+    const roundData = await this.contract.rounds(epoch);
     return {
-      epoch: Number(roundData[0]),
-      startTimestamp: Number(roundData[1]),
-      lockTimestamp: Number(roundData[2]),
-      closeTimestamp: Number(roundData[3]),
-      lockPrice: roundData[4],
-      closePrice: roundData[5],
-      totalAmount: roundData[8],
-      bullAmount: roundData[9],
-      bearAmount: roundData[10],
-      oracleCalled: roundData[13],
+      epoch: Number(roundData.epoch),
+      startTimestamp: Number(roundData.startTimestamp),
+      lockTimestamp: Number(roundData.lockTimestamp),
+      closeTimestamp: Number(roundData.closeTimestamp),
+      lockPrice: BigInt(roundData.lockPrice),
+      closePrice: BigInt(roundData.closePrice),
+      totalAmount: BigInt(roundData.totalAmount),
+      bullAmount: BigInt(roundData.bullAmount),
+      bearAmount: BigInt(roundData.bearAmount),
+      oracleCalled: roundData.oracleCalled,
     };
   }
 
   private async placeBet(epoch: number) {
     const round = await this.getRoundData(epoch);
+    const { position, betAmount } = this.calculateBetPosition(round);
 
+    if (await this.hasSufficientBalance(betAmount)) {
+      await this.executeBet(epoch, position, betAmount);
+    }
+  }
+
+  private calculateBetPosition(round: Round): {
+    position: 'Bull' | 'Bear';
+    betAmount: bigint;
+  } {
     const treasuryFee = (round.totalAmount * 300n) / 10000n;
     const prizePool = round.totalAmount - treasuryFee;
 
@@ -202,47 +209,63 @@ export class PredictionService {
     const bearPayout =
       round.bearAmount > 0n ? prizePool / round.bearAmount : 0n;
 
-    const position = bullPayout > bearPayout ? 'Bull' : 'Bear';
+    return {
+      position: bullPayout > bearPayout ? 'Bull' : 'Bear',
+      betAmount: this.currentBetAmount,
+    };
+  }
 
-    const balance = await this.publicClient.getBalance({
-      address: this.walletClient.account.address,
-    });
+  private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
+    const balance = await this.provider.getBalance(this.wallet.address);
 
-    if (balance < this.currentBetAmount) {
-      this.telegramService.sendMessage(
-        this.receiverTgId,
-        `⚠️ Insufficient balance for bet: ${this.formatBnb(this.currentBetAmount)} BNB`,
+    if (balance < betAmount) {
+      this.sendTelegramMessage(
+        `⚠️ Insufficient balance for bet: ${ethers.formatEther(betAmount)} BNB`,
       );
-      return;
+      return false;
     }
+    return true;
+  }
 
+  private async executeBet(
+    epoch: number,
+    position: 'Bull' | 'Bear',
+    betAmount: bigint,
+  ) {
     try {
-      const { request } = await this.publicClient.simulateContract({
-        ...this.contract,
-        functionName: position === 'Bull' ? 'betBull' : 'betBear',
-        args: [BigInt(epoch)],
-        value: this.currentBetAmount,
-        account: this.walletClient.account.address,
+      const method = position === 'Bull' ? 'betBull' : 'betBear';
+      const tx = await this.contract[method](epoch, {
+        value: betAmount,
+        gasLimit: 300000, // Устанавливаем лимит газа явно
       });
-
-      const txHash = await this.walletClient.writeContract(request);
 
       this.lastBetPosition = position;
       this.lastBetEpoch = epoch;
 
-      this.telegramService.sendMessage(
-        this.receiverTgId,
-        `🎲 Placed ${this.formatBnb(this.currentBetAmount)} BNB on ${position} (#${epoch}) | Tx: ${txHash}`,
+      this.sendTelegramMessage(
+        `🎲 Placed ${ethers.formatEther(betAmount)} BNB on ${position} (#${epoch}) | Tx: ${tx.hash}`,
       );
-    } catch (err) {
-      this.telegramService.sendMessage(
-        this.receiverTgId,
-        `⚠️ Failed to place bet: ${err.message}`,
+
+      const receipt = await tx.wait();
+      if (receipt.status === 0) {
+        throw new Error('Transaction reverted');
+      }
+    } catch (error) {
+      this.sendTelegramMessage(
+        `⚠️ Failed to place bet: ${error.reason || error.message}`,
       );
+      this.logger.error('Bet execution failed', error);
     }
   }
 
-  private formatBnb(value: bigint): string {
-    return Number(value / 10n ** 12n) / 1_000_000 + '';
+  private sendTelegramMessage(message: string) {
+    this.telegramService.sendMessage(
+      this.config.get('RECEIVER_TELEGRAM_ID'),
+      message,
+    );
+  }
+
+  private formatPrice(value: bigint): string {
+    return Number(value / 10n ** 6n) / 100 + '';
   }
 }
