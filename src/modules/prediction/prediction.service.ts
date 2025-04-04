@@ -130,7 +130,7 @@ export class PredictionService implements OnModuleInit {
 
   private async claimWinnings(epoch: number) {
     try {
-      const tx = await this.contract.claim([epoch]);
+      const tx = await this.contract.claim([epoch - 1]);
       this.sendTelegramMessage(
         `🏆 Claimed rewards for round #${epoch} | Tx: ${tx.hash}`,
       );
@@ -154,37 +154,53 @@ export class PredictionService implements OnModuleInit {
   private async startBettingStrategy() {
     setInterval(async () => {
       try {
+        // Получаем текущий и следующий раунды
         const currentEpoch = Number(await this.contract.currentEpoch());
-        const round = await this.getRoundData(currentEpoch);
-        const now = Math.floor(Date.now() / 1000);
+        const nextEpoch = currentEpoch + 1;
 
-        this.logger.debug(
-          `Checking round #${currentEpoch} | Now: ${now} | Lock: ${round.lockTimestamp} | Remaining: ${round.lockTimestamp - now}s`,
-        );
+        // Получаем данные для обоих раундов
+        const currentRound = await this.getRoundData(currentEpoch);
+        const nextRound = await this.getRoundData(nextEpoch);
 
-        if (this.isBettable(round)) {
-          await this.placeBet(currentEpoch);
+        // Определяем активный раунд для ставок
+        const bettingRound = this.isRoundBettable(nextRound)
+          ? nextRound
+          : currentRound;
+
+        if (this.isBettable(bettingRound)) {
+          await this.placeBet(bettingRound.epoch);
         }
       } catch (error) {
         this.sendTelegramMessage(
           `❌ Strategy error: ${error.reason || error.message}`,
         );
       }
-    }, 1_000); // Проверяем каждую секунду
+    }, 1_000);
+  }
+
+  private isRoundBettable(round: Round): boolean {
+    const now = Math.floor(Date.now() / 1000);
+    return (
+      round.startTimestamp <= now &&
+      now < round.lockTimestamp &&
+      !round.oracleCalled
+    );
   }
 
   private isBettable(round: Round): boolean {
     const now = Math.floor(Date.now() / 1000);
-
+    // Делаем ставку за 5 секунд до закрытия приема
     return (
-      !round.oracleCalled && // Раунд еще не закрыт
-      now >= round.lockTimestamp - 5 && // За 5 секунд до блокировки
-      now < round.lockTimestamp // Еще не заблокирован
+      now >= round.lockTimestamp - 5 &&
+      now < round.lockTimestamp &&
+      this.isRoundBettable(round)
     );
   }
 
   private async getRoundData(epoch: number): Promise<Round> {
     const roundData = await this.contract.rounds(epoch);
+    const now = Math.floor(Date.now() / 1000);
+
     return {
       epoch: Number(roundData.epoch),
       startTimestamp: Number(roundData.startTimestamp),
@@ -196,7 +212,7 @@ export class PredictionService implements OnModuleInit {
       bullAmount: BigInt(roundData.bullAmount),
       bearAmount: BigInt(roundData.bearAmount),
       oracleCalled: roundData.oracleCalled,
-      canBet: roundData[11], // Индекс поля canBet в ABI
+      canBet: now < Number(roundData.lockTimestamp) && !roundData.oracleCalled,
     };
   }
 
@@ -245,50 +261,39 @@ export class PredictionService implements OnModuleInit {
     betAmount: bigint,
   ) {
     try {
-      // Добавляем проверку на возможность ставки
       const round = await this.getRoundData(epoch);
-      if (!round.canBet) {
-        this.logger.debug(`Betting not allowed for epoch ${epoch}`);
-        return;
-      }
+      if (!round.canBet) return;
 
       const method = position === 'Bull' ? 'betBull' : 'betBear';
 
-      // Увеличиваем газ и устанавливаем правильный gasPrice
-      const gasEstimate = await this.contract[method].estimateGas(epoch, {
-        value: betAmount,
-      });
-
-      const nonce = await this.provider.getTransactionCount(
-        this.wallet.address,
-        'latest',
-      );
+      // Получаем актуальные параметры газа
+      const [gasEstimate, nonce] = await Promise.all([
+        this.contract[method].estimateGas(epoch, { value: betAmount }),
+        this.provider.getTransactionCount(this.wallet.address, 'latest'),
+      ]);
 
       const tx = await this.contract[method](epoch, {
         value: betAmount,
-        gasLimit: gasEstimate, // Запас газа
-        nonce,
+        gasLimit: (gasEstimate * 120n) / 100n, // +20% buffer
+        nonce: nonce,
       });
 
-      // Блокируем повторные ставки сразу после успешной отправки
+      // Блокируем повторные ставки
       this.lastBetPosition = position;
       this.lastBetEpoch = epoch;
 
-      this.sendTelegramMessage(
-        `🎲 Placed ${ethers.formatEther(betAmount)} BNB on ${position} (#${epoch}) | Tx: ${tx.hash}`,
-      );
+      // Ждем 1 подтверждение
+      await tx.wait(1);
 
-      const receipt = await tx.wait();
-      if (receipt.status === 0) {
-        throw new Error('Transaction reverted');
-      }
-    } catch (error) {
-      // Сбрасываем состояние при ошибке
-      this.resetBetState();
       this.sendTelegramMessage(
-        `⚠️ Failed to place bet: ${error.reason || error.message}`,
+        `🎲 Bet ${ethers.formatEther(betAmount)} BNB on ${position} (#${epoch}) | Tx: ${tx.hash}`,
       );
-      this.logger.error('Bet execution failed', error);
+    } catch (error) {
+      this.resetBetState();
+      this.logger.error('Bet failed', error);
+      this.sendTelegramMessage(
+        `⚠️ Bet error: ${error.reason || error.message}`,
+      );
     }
   }
 
