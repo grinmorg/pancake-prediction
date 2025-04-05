@@ -38,7 +38,7 @@ interface BetHistory {
 
 @Injectable()
 export class PredictionService implements OnModuleInit {
-  private readonly LOSS_MULTIPLIER = BigInt(2.2);
+  private readonly LOSS_MULTIPLIER = 22n; // 2.2x
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
@@ -183,7 +183,8 @@ export class PredictionService implements OnModuleInit {
         stream.currentAmount = this.baseBetAmount;
         stream.lossCount = 0;
       } else {
-        stream.currentAmount = stream.currentAmount * this.LOSS_MULTIPLIER;
+        stream.currentAmount =
+          (stream.currentAmount * this.LOSS_MULTIPLIER) / 10n;
         stream.lossCount++;
       }
 
@@ -303,9 +304,9 @@ export class PredictionService implements OnModuleInit {
   private isBettable(round: Round): boolean {
     const now = Math.floor(Date.now() / 1000);
 
-    // Делаем ставку за 15 сек до конца раунда
+    // Делаем ставку за 11 сек до конца раунда
     return (
-      now >= round.lockTimestamp - 15 &&
+      now >= round.lockTimestamp - 11 &&
       now < round.lockTimestamp &&
       this.isRoundBettable(round) &&
       !this.hasExistingBet(round.epoch)
