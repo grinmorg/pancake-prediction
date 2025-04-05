@@ -150,7 +150,6 @@ export class PredictionService implements OnModuleInit {
       );
       if (betsForRound.length > 0) {
         await this.handleRoundResult(Number(epoch));
-        await this.checkAndClaimWinnings();
       }
     });
 
@@ -164,33 +163,23 @@ export class PredictionService implements OnModuleInit {
     const round = await this.getRoundData(epoch);
     const betsForRound = this.betHistory.filter((b) => b.epoch === epoch);
 
-    // Отправляем результаты для каждой ставки
-    betsForRound.forEach((bet) => {
+    for (const bet of betsForRound) {
       const stream = this.activeStreams.find((s) => s.id === bet.streamId);
-      if (!stream) return;
+      if (!stream) continue;
 
       const isWin = this.checkSingleBetResult(bet, round);
       const resultEmoji = isWin ? '✅' : '❌';
-      const resultText = isWin ? 'WON' : 'LOST';
 
       const message =
-        `${resultEmoji} Stream #${stream.id} ${resultText} round #${epoch}\n` +
+        `${resultEmoji} Stream #${stream.id} ${isWin ? 'WON' : 'LOST'} round #${epoch}\n` +
         `💰 Bet: ${ethers.formatEther(bet.amount)} BNB on ${bet.position}\n` +
-        `🔒 Lock: ${ethers.formatUnits(round.lockPrice, 8)}\n` +
-        `🔓 Close: ${ethers.formatUnits(round.closePrice, 8)}\n` +
         `📉 Loss Streak: ${stream.lossCount}`;
 
       this.sendTelegramMessage(message);
-    });
 
-    // Обновляем состояния потоков
-    betsForRound.forEach((bet) => {
-      const stream = this.activeStreams.find((s) => s.id === bet.streamId);
-      if (!stream) return;
-
-      const isWin = this.checkSingleBetResult(bet, round);
-
+      // Обновление статуса ставки и потока
       if (isWin) {
+        await this.claimSingleBet(bet);
         stream.currentAmount = this.baseBetAmount;
         stream.lossCount = 0;
       } else {
@@ -198,15 +187,15 @@ export class PredictionService implements OnModuleInit {
         stream.lossCount++;
       }
 
-      // Обновляем историю позиций
-      stream.positionHistory.push(bet.position);
-      if (stream.positionHistory.length > 5) {
-        stream.positionHistory.shift();
-      }
-    });
+      // Обновление истории позиций
+      stream.positionHistory = [
+        ...stream.positionHistory.slice(-4),
+        bet.position,
+      ];
+    }
 
-    // Отправляем обновленные ставки потоков
-    const streamsInfo = this.activeStreams
+    // Отправка обновленного статуса потоков
+    const streamsStatus = this.activeStreams
       .map(
         (stream) =>
           `📊 Stream #${stream.id}: ${ethers.formatEther(stream.currentAmount)} BNB\n` +
@@ -215,57 +204,25 @@ export class PredictionService implements OnModuleInit {
       .join('\n\n');
 
     this.sendTelegramMessage(
-      `🔄 Updated streams after round #${epoch}:\n\n${streamsInfo}`,
+      `🔄 Streams status after round #${epoch}:\n\n${streamsStatus}`,
     );
-
-    await this.checkAndClaimWinnings();
   }
 
-  private async checkAndClaimWinnings() {
-    if (this.betHistory.length < this.WIN_STREAK_TO_CLAIM) return;
+  private async claimSingleBet(bet: BetHistory) {
+    if (bet.claimed) return;
 
-    // Находим последние 3 не заклеймленные ставки
-    const unclaimedBets = this.betHistory.filter((b) => !b.claimed);
-    this.sendTelegramMessage(
-      `⏳ Non-claimed rounds count: ${unclaimedBets.length}, waiting ${this.WIN_STREAK_TO_CLAIM} streak.`,
-    );
+    try {
+      const tx = await this.contract.claim([bet.epoch]);
+      await tx.wait();
 
-    if (unclaimedBets.length < this.WIN_STREAK_TO_CLAIM) return;
-
-    // Берем последние 3 ставки
-    const lastThreeBets = unclaimedBets.slice(-this.WIN_STREAK_TO_CLAIM);
-
-    // Проверяем, что все 3 выиграли
-    const rounds = await Promise.all(
-      lastThreeBets.map((bet) => this.getRoundData(bet.epoch)),
-    );
-
-    const allWon = lastThreeBets.every((bet, index) =>
-      this.checkSingleBetResult(bet, rounds[index]),
-    );
-
-    if (allWon) {
-      const epochsToClaim = lastThreeBets.map((bet) => bet.epoch);
-      try {
-        const tx = await this.contract.claim(epochsToClaim);
-        await tx.wait();
-
-        // Помечаем ставки как заклеймленные
-        lastThreeBets.forEach((bet) => {
-          const betToUpdate = this.betHistory.find(
-            (b) => b.epoch === bet.epoch && b.position === bet.position,
-          );
-          if (betToUpdate) betToUpdate.claimed = true;
-        });
-
-        this.sendTelegramMessage(
-          `🏆 Claimed rewards for rounds: ${epochsToClaim.join(', ')} | Tx: ${tx.hash}`,
-        );
-      } catch (error) {
-        this.sendTelegramMessage(
-          `⚠️ Failed to claim rewards: ${error.reason || error.message}`,
-        );
-      }
+      bet.claimed = true;
+      this.sendTelegramMessage(
+        `🏆 Claimed reward for round ${bet.epoch} | Tx: ${tx.hash}`,
+      );
+    } catch (error) {
+      this.sendTelegramMessage(
+        `⚠️ Failed to claim round ${bet.epoch}: ${error.message}`,
+      );
     }
   }
 
@@ -307,25 +264,31 @@ export class PredictionService implements OnModuleInit {
   }
 
   private selectStreamForBet(epoch: number): BetStream | null {
-    const availableStreams = this.activeStreams.filter(
-      (stream) =>
+    const availableStreams = this.activeStreams.filter((stream) => {
+      const isAvailable =
         stream.lastEpoch !== epoch &&
         !this.betHistory.some(
           (b) => b.epoch === epoch && b.streamId === stream.id,
-        ),
-    );
+        );
 
-    if (availableStreams.length === 0) return null;
+      this.logger.debug(`Stream #${stream.id} available: ${isAvailable}`);
+      return isAvailable;
+    });
 
-    // Выбираем следующий поток в доступных
-    const nextIndex =
-      (this.activeStreams.findIndex((s) => s.id === availableStreams[0].id) +
-        1) %
-      this.activeStreams.length;
-    return (
-      availableStreams.find((s) => s.id === this.activeStreams[nextIndex].id) ||
-      availableStreams[0]
+    if (availableStreams.length === 0) {
+      this.logger.debug('No available streams');
+      return null;
+    }
+
+    // Чередование потоков по модулю
+    const selectedIndex = this.lastUsedStreamIndex % availableStreams.length;
+    this.lastUsedStreamIndex++;
+    const selectedStream = availableStreams[selectedIndex];
+
+    this.logger.debug(
+      `Selected stream #${selectedStream.id} for epoch ${epoch}`,
     );
+    return selectedStream;
   }
 
   private isRoundBettable(round: Round): boolean {
