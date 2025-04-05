@@ -38,6 +38,7 @@ interface BetHistory {
 
 @Injectable()
 export class PredictionService implements OnModuleInit {
+  private readonly LOSS_MULTIPLIER = 2n;
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
@@ -50,6 +51,7 @@ export class PredictionService implements OnModuleInit {
   private readonly WIN_STREAK_TO_CLAIM = 3;
   private activeStreams: BetStream[] = [];
   private readonly MAX_STREAMS = 2;
+  private lastUsedStreamIndex = 0;
 
   constructor(
     private readonly config: ConfigService,
@@ -161,8 +163,8 @@ export class PredictionService implements OnModuleInit {
     const round = await this.getRoundData(epoch);
     const betsForRound = this.betHistory.filter((b) => b.epoch === epoch);
 
-    // Добавляем отправку результатов для каждой ставки
-    betsForRound.forEach(async (bet) => {
+    // Отправляем результаты для каждой ставки
+    betsForRound.forEach((bet) => {
       const stream = this.activeStreams.find((s) => s.id === bet.streamId);
       if (!stream) return;
 
@@ -170,36 +172,17 @@ export class PredictionService implements OnModuleInit {
       const resultEmoji = isWin ? '✅' : '❌';
       const resultText = isWin ? 'WON' : 'LOST';
 
-      // Формируем сообщение о результате ставки
-      const betResultMessage =
+      const message =
         `${resultEmoji} Stream #${stream.id} ${resultText} round #${epoch}\n` +
         `💰 Bet: ${ethers.formatEther(bet.amount)} BNB on ${bet.position}\n` +
-        `🔒 Lock Price: ${ethers.formatUnits(round.lockPrice, 8)}\n` +
-        `🔓 Close Price: ${ethers.formatUnits(round.closePrice, 8)}`;
+        `🔒 Lock: ${ethers.formatUnits(round.lockPrice, 8)}\n` +
+        `🔓 Close: ${ethers.formatUnits(round.closePrice, 8)}\n` +
+        `📉 Loss Streak: ${stream.lossCount}`;
 
-      this.sendTelegramMessage(betResultMessage);
+      this.sendTelegramMessage(message);
     });
 
-    // Обновляем информацию о потоках
-    this.activeStreams.forEach((stream) => {
-      const currentAmount = ethers.formatEther(stream.currentAmount);
-      this.logger.log(`Stream #${stream.id} current bet: ${currentAmount} BNB`);
-    });
-
-    // Отправляем обновленные данные по потокам
-    const streamsStatus = this.activeStreams
-      .map(
-        (stream) =>
-          `📈 Stream #${stream.id}: ${ethers.formatEther(stream.currentAmount)} BNB\n` +
-          `📉 Loss Streak: ${stream.lossCount}`,
-      )
-      .join('\n\n');
-
-    this.sendTelegramMessage(
-      `🔄 Updated streams status after round #${epoch}:\n\n${streamsStatus}`,
-    );
-
-    // Остальная логика обработки
+    // Обновляем состояния потоков
     betsForRound.forEach((bet) => {
       const stream = this.activeStreams.find((s) => s.id === bet.streamId);
       if (!stream) return;
@@ -209,17 +192,30 @@ export class PredictionService implements OnModuleInit {
       if (isWin) {
         stream.currentAmount = this.baseBetAmount;
         stream.lossCount = 0;
-        stream.positionHistory = [];
       } else {
-        stream.currentAmount = (stream.currentAmount * 25n) / 10n;
+        stream.currentAmount = stream.currentAmount * this.LOSS_MULTIPLIER;
         stream.lossCount++;
       }
 
+      // Обновляем историю позиций
       stream.positionHistory.push(bet.position);
       if (stream.positionHistory.length > 5) {
         stream.positionHistory.shift();
       }
     });
+
+    // Отправляем обновленные ставки потоков
+    const streamsInfo = this.activeStreams
+      .map(
+        (stream) =>
+          `📊 Stream #${stream.id}: ${ethers.formatEther(stream.currentAmount)} BNB\n` +
+          `📉 Losses: ${stream.lossCount}`,
+      )
+      .join('\n\n');
+
+    this.sendTelegramMessage(
+      `🔄 Updated streams after round #${epoch}:\n\n${streamsInfo}`,
+    );
 
     await this.checkAndClaimWinnings();
   }
@@ -310,7 +306,7 @@ export class PredictionService implements OnModuleInit {
   }
 
   private selectStreamForBet(epoch: number): BetStream | null {
-    // Ищем поток, который не делал ставку в текущей эпохе
+    // Фильтруем доступные потоки
     const availableStreams = this.activeStreams.filter(
       (stream) =>
         stream.lastEpoch !== epoch &&
@@ -321,10 +317,10 @@ export class PredictionService implements OnModuleInit {
 
     if (availableStreams.length === 0) return null;
 
-    // Выбираем поток с наибольшим количеством проигрышей
-    return availableStreams.reduce((prev, current) =>
-      prev.lossCount > current.lossCount ? prev : current,
-    );
+    // Выбираем следующий поток по очереди
+    this.lastUsedStreamIndex =
+      (this.lastUsedStreamIndex + 1) % availableStreams.length;
+    return availableStreams[this.lastUsedStreamIndex];
   }
 
   private isRoundBettable(round: Round): boolean {
