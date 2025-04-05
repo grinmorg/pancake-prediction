@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { ethers } from 'ethers';
 import { TelegramService } from '../telegram-bot/telegram.service';
 import { predictionAbi } from './pancake-prediction-abi';
+import axios from 'axios';
 
 const CONTRACT_ADDRESS = '0x18b2a687610328590bc8f2e5fedde3b582a49cda';
 
@@ -54,6 +55,10 @@ export class PredictionService implements OnModuleInit {
   private readonly MAX_STREAMS = 2;
   private lastUsedStreamIndex = 0;
 
+  private dailyPnL: number = 0; // В USD
+  private dailyResetTimer: NodeJS.Timeout;
+  private currentBnbPrice: number = 0;
+
   constructor(
     private readonly config: ConfigService,
     private readonly telegramService: TelegramService,
@@ -74,6 +79,9 @@ export class PredictionService implements OnModuleInit {
 
     this.listenToEvents();
     this.startBettingStrategy();
+
+    this.startDailyReset();
+    this.startBnbPriceUpdater();
   }
 
   private async initializeProvider() {
@@ -161,6 +169,42 @@ export class PredictionService implements OnModuleInit {
     });
   }
 
+  private async updateBnbPrice(): Promise<void> {
+    try {
+      const response = await axios.get(
+        'https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT',
+      );
+      this.currentBnbPrice = parseFloat(response.data.price);
+    } catch (error) {
+      this.logger.error('Failed to update BNB price', error);
+    }
+  }
+
+  private startBnbPriceUpdater(): void {
+    setInterval(async () => {
+      await this.updateBnbPrice();
+    }, 60_000); // Обновление курса каждую минуту
+    this.updateBnbPrice(); // Первоначальное обновление
+  }
+
+  private startDailyReset(): void {
+    const now = new Date();
+    const nextReset = new Date(now);
+    nextReset.setUTCHours(24, 0, 0, 0); // Сброс в 00:00 UTC
+
+    const initialDelay = nextReset.getTime() - now.getTime();
+
+    this.dailyResetTimer = setTimeout(() => {
+      this.dailyPnL = 0;
+      this.sendTelegramMessage('🔄 Daily PnL reset to $0.00');
+      // Повторяем каждый день
+      setInterval(() => {
+        this.dailyPnL = 0;
+        this.sendTelegramMessage('🔄 Daily PnL reset to $0.00');
+      }, 86_400_000);
+    }, initialDelay);
+  }
+
   private async handleRoundResult(epoch: number) {
     const round = await this.getRoundData(epoch);
     const betsForRound = this.betHistory.filter((b) => b.epoch === epoch);
@@ -171,6 +215,17 @@ export class PredictionService implements OnModuleInit {
 
       const isWin = this.checkSingleBetResult(bet, round);
       const resultEmoji = isWin ? '✅' : '❌';
+
+      if (isWin) {
+        const reward = await this.calculateReward(bet);
+        const usdReward = reward * this.currentBnbPrice;
+        this.dailyPnL += usdReward;
+
+        this.sendTelegramMessage(
+          `📈 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
+            `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
+        );
+      }
 
       const message =
         `${resultEmoji} Stream #${stream.id} ${isWin ? 'WON' : 'LOST'} round #${epoch}\n` +
@@ -211,6 +266,27 @@ export class PredictionService implements OnModuleInit {
     );
   }
 
+  private async calculateReward(bet: BetHistory): Promise<number> {
+    try {
+      const round = await this.getRoundData(bet.epoch);
+      const totalAmount = parseFloat(ethers.formatEther(round.totalAmount));
+      const positionAmount = parseFloat(
+        ethers.formatEther(
+          bet.position === 'Bull' ? round.bullAmount : round.bearAmount,
+        ),
+      );
+
+      const treasuryFee = totalAmount * 0.03; // 3% fee
+      const rewardPool = totalAmount - treasuryFee;
+      const payout = rewardPool / positionAmount;
+
+      return parseFloat(ethers.formatEther(bet.amount)) * payout;
+    } catch (error) {
+      this.logger.error('Reward calculation failed', error);
+      return 0;
+    }
+  }
+
   private async claimSingleBet(bet: BetHistory) {
     if (bet.claimed) return;
 
@@ -219,8 +295,15 @@ export class PredictionService implements OnModuleInit {
       await tx.wait();
 
       bet.claimed = true;
+      const reward = await this.calculateReward(bet);
+      const usdReward = reward * this.currentBnbPrice;
+      this.dailyPnL += usdReward;
+
       this.sendTelegramMessage(
-        `🏆 Claimed reward for round ${bet.epoch} | Tx: ${tx.hash}`,
+        `🏆 Claimed reward for round ${bet.epoch}\n` +
+          `💰 Reward: $${usdReward.toFixed(2)}\n` +
+          `📈 Total Daily PnL: $${this.dailyPnL.toFixed(2)}\n` +
+          `Tx: ${tx.hash}`,
       );
     } catch (error) {
       this.sendTelegramMessage(
