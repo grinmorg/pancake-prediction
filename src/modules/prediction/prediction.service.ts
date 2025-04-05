@@ -39,6 +39,7 @@ interface BetHistory {
 @Injectable()
 export class PredictionService implements OnModuleInit {
   private readonly LOSS_MULTIPLIER = 22n; // 2.2x
+  private readonly BASE_BET_MULTIPLIER = 1n; // 1x - min bet usually 0.6$
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
@@ -110,7 +111,8 @@ export class PredictionService implements OnModuleInit {
       this.wallet,
     );
 
-    this.baseBetAmount = await this.contract.minBetAmount();
+    this.baseBetAmount =
+      (await this.contract.minBetAmount()) * this.BASE_BET_MULTIPLIER;
     this.currentBetAmount = this.baseBetAmount;
     this.logger.log(
       `Min bet amount: ${ethers.formatEther(this.baseBetAmount)} BNB`,
