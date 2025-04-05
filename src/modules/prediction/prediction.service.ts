@@ -61,8 +61,6 @@ export class PredictionService implements OnModuleInit {
   async onModuleInit() {
     await this.initializeProvider();
     await this.initializeContract();
-    this.listenToEvents();
-    this.startBettingStrategy();
 
     // Initialize the bet streams
     this.activeStreams = Array.from({ length: this.MAX_STREAMS }, (_, i) => ({
@@ -72,6 +70,9 @@ export class PredictionService implements OnModuleInit {
       lastEpoch: null,
       positionHistory: [],
     }));
+
+    this.listenToEvents();
+    this.startBettingStrategy();
   }
 
   private async initializeProvider() {
@@ -306,7 +307,6 @@ export class PredictionService implements OnModuleInit {
   }
 
   private selectStreamForBet(epoch: number): BetStream | null {
-    // Фильтруем доступные потоки
     const availableStreams = this.activeStreams.filter(
       (stream) =>
         stream.lastEpoch !== epoch &&
@@ -317,10 +317,15 @@ export class PredictionService implements OnModuleInit {
 
     if (availableStreams.length === 0) return null;
 
-    // Выбираем следующий поток по очереди
-    this.lastUsedStreamIndex =
-      (this.lastUsedStreamIndex + 1) % availableStreams.length;
-    return availableStreams[this.lastUsedStreamIndex];
+    // Выбираем следующий поток в доступных
+    const nextIndex =
+      (this.activeStreams.findIndex((s) => s.id === availableStreams[0].id) +
+        1) %
+      this.activeStreams.length;
+    return (
+      availableStreams.find((s) => s.id === this.activeStreams[nextIndex].id) ||
+      availableStreams[0]
+    );
   }
 
   private isRoundBettable(round: Round): boolean {
