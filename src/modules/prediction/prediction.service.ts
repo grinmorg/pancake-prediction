@@ -38,7 +38,7 @@ interface BetHistory {
 
 @Injectable()
 export class PredictionService implements OnModuleInit {
-  private readonly LOSS_MULTIPLIER = 2n;
+  private readonly LOSS_MULTIPLIER = BigInt(2.2);
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
