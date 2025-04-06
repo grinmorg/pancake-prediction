@@ -45,12 +45,8 @@ export class PredictionService implements OnModuleInit {
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
   private contract: ethers.Contract;
-  private currentBetAmount: bigint;
   private baseBetAmount: bigint;
-  private lastBetPosition: 'Bull' | 'Bear' | null = null;
-  private lastBetEpoch: number | null = null;
   private betHistory: BetHistory[] = [];
-  private readonly WIN_STREAK_TO_CLAIM = 3;
   private activeStreams: BetStream[] = [];
   private readonly MAX_STREAMS = 2;
   private lastUsedStreamIndex = 0;
@@ -67,7 +63,6 @@ export class PredictionService implements OnModuleInit {
   async onModuleInit() {
     await this.initializeProvider();
     await this.initializeContract();
-
     // Initialize the bet streams
     this.activeStreams = Array.from({ length: this.MAX_STREAMS }, (_, i) => ({
       id: i + 1,
@@ -76,10 +71,8 @@ export class PredictionService implements OnModuleInit {
       lastEpoch: null,
       positionHistory: [],
     }));
-
     this.listenToEvents();
     this.startBettingStrategy();
-
     this.startDailyReset();
     this.startBnbPriceUpdater();
   }
@@ -121,7 +114,6 @@ export class PredictionService implements OnModuleInit {
 
     this.baseBetAmount =
       (await this.contract.minBetAmount()) * this.BASE_BET_MULTIPLIER;
-    this.currentBetAmount = this.baseBetAmount;
     this.logger.log(
       `Min bet amount: ${ethers.formatEther(this.baseBetAmount)} BNB`,
     );
@@ -167,6 +159,22 @@ export class PredictionService implements OnModuleInit {
       this.logger.error('Provider error:', error);
       this.sendTelegramMessage(`⚠️ Provider error: ${error.message}`);
     });
+  }
+
+  private async getBtcRsi(): Promise<{ value: number }> {
+    const TAAPI_SECRET = this.config.get('TAAPI_SECRET');
+
+    try {
+      const response = await axios.get<{ value: number }>(
+        `https://api.taapi.io/rsi?secret=${TAAPI_SECRET}&exchange=binance&symbol=BTC/USDT&interval=5m`,
+      );
+      return {
+        value: response.data.value,
+      };
+    } catch (error) {
+      this.logger.error('Failed to update BTC RSI', error);
+      return { value: 29 }; // В случае ошибки, вернем значение для ставки на Bull
+    }
   }
 
   private async updateBnbPrice(): Promise<void> {
@@ -216,16 +224,17 @@ export class PredictionService implements OnModuleInit {
       const isWin = this.checkSingleBetResult(bet, round);
       const resultEmoji = isWin ? '✅' : '❌';
 
+      const reward = await this.calculateReward(bet);
+      const usdReward = reward * this.currentBnbPrice;
       if (isWin) {
-        const reward = await this.calculateReward(bet);
-        const usdReward = reward * this.currentBnbPrice;
         this.dailyPnL += usdReward;
-
-        this.sendTelegramMessage(
-          `📈 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
-            `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
-        );
+      } else {
+        this.dailyPnL -= usdReward;
       }
+      this.sendTelegramMessage(
+        `📈 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
+          `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
+      );
 
       const message =
         `${resultEmoji} Stream #${stream.id} ${isWin ? 'WON' : 'LOST'} round #${epoch}\n` +
@@ -422,8 +431,7 @@ export class PredictionService implements OnModuleInit {
   }
 
   private async placeBet(epoch: number, stream: BetStream) {
-    const round = await this.getRoundData(epoch);
-    const position = this.calculateBetPosition(round, stream);
+    const position = await this.calculateBetPosition();
 
     if (await this.hasSufficientBalance(stream.currentAmount)) {
       try {
@@ -454,31 +462,11 @@ export class PredictionService implements OnModuleInit {
     }
   }
 
-  private calculateBetPosition(
-    round: Round,
-    stream: BetStream,
-  ): 'Bull' | 'Bear' {
-    // Анализ истории позиций для выбора направления
-    const lastPosition =
-      stream.positionHistory[stream.positionHistory.length - 1];
-    const secondLast =
-      stream.positionHistory[stream.positionHistory.length - 2];
+  private async calculateBetPosition(): Promise<'Bull' | 'Bear'> {
+    const rsi = await this.getBtcRsi();
 
-    // Если два последних проигрыша на одном направлении - меняем
-    if (lastPosition && lastPosition === secondLast) {
-      return lastPosition === 'Bull' ? 'Bear' : 'Bull';
-    }
-
-    // Базовая логика из предыдущей реализации
-    const treasuryFee = (round.totalAmount * 300n) / 10000n;
-    const prizePool = round.totalAmount - treasuryFee;
-
-    const bullPayout =
-      round.bullAmount > 0n ? prizePool / round.bullAmount : 0n;
-    const bearPayout =
-      round.bearAmount > 0n ? prizePool / round.bearAmount : 0n;
-
-    return bullPayout > bearPayout ? 'Bull' : 'Bear';
+    // Если RSI меньшн 30 то ставим на Bull, иначе на Bear
+    return rsi.value < 30 ? 'Bull' : 'Bear';
   }
 
   private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
