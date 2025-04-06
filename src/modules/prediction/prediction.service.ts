@@ -423,7 +423,7 @@ export class PredictionService implements OnModuleInit {
 
   private async placeBet(epoch: number, stream: BetStream) {
     const round = await this.getRoundData(epoch);
-    const position = this.calculateBetPosition(round, stream);
+    const position = this.calculateBetPosition(round);
 
     if (await this.hasSufficientBalance(stream.currentAmount)) {
       try {
@@ -454,31 +454,9 @@ export class PredictionService implements OnModuleInit {
     }
   }
 
-  private calculateBetPosition(
-    round: Round,
-    stream: BetStream,
-  ): 'Bull' | 'Bear' {
-    // Анализ истории позиций для выбора направления
-    const lastPosition =
-      stream.positionHistory[stream.positionHistory.length - 1];
-    const secondLast =
-      stream.positionHistory[stream.positionHistory.length - 2];
-
-    // Если два последних проигрыша на одном направлении - меняем
-    if (lastPosition && lastPosition === secondLast) {
-      return lastPosition === 'Bull' ? 'Bear' : 'Bull';
-    }
-
-    // Базовая логика из предыдущей реализации
-    const treasuryFee = (round.totalAmount * 300n) / 10000n;
-    const prizePool = round.totalAmount - treasuryFee;
-
-    const bullPayout =
-      round.bullAmount > 0n ? prizePool / round.bullAmount : 0n;
-    const bearPayout =
-      round.bearAmount > 0n ? prizePool / round.bearAmount : 0n;
-
-    return bullPayout > bearPayout ? 'Bull' : 'Bear';
+  private calculateBetPosition(round: Round): 'Bull' | 'Bear' {
+    // Выбираем направление с меньшим объемом ставок для лучшего коэффициента
+    return round.bullAmount < round.bearAmount ? 'Bull' : 'Bear';
   }
 
   private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
