@@ -40,12 +40,11 @@ interface BetHistory {
 @Injectable()
 export class PredictionService implements OnModuleInit {
   private readonly LOSS_MULTIPLIER = 21n; // 2.1x
-  private readonly BASE_BET_MULTIPLIER = 1n; // 1x - min bet usually 0.6$
+  private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
   private contract: ethers.Contract;
-  private currentBetAmount: bigint;
   private baseBetAmount: bigint;
   private lastBetPosition: 'Bull' | 'Bear' | null = null;
   private lastBetEpoch: number | null = null;
@@ -55,7 +54,7 @@ export class PredictionService implements OnModuleInit {
   private readonly MAX_STREAMS = 2;
   private lastUsedStreamIndex = 0;
 
-  private dailyPnL: number = 0; // В USD
+  private dailyPnL: number = 0;
   private dailyResetTimer: NodeJS.Timeout;
   private currentBnbPrice: number = 0;
 
@@ -68,7 +67,6 @@ export class PredictionService implements OnModuleInit {
     await this.initializeProvider();
     await this.initializeContract();
 
-    // Initialize the bet streams
     this.activeStreams = Array.from({ length: this.MAX_STREAMS }, (_, i) => ({
       id: i + 1,
       currentAmount: this.baseBetAmount,
@@ -93,10 +91,7 @@ export class PredictionService implements OnModuleInit {
 
       this.provider = new ethers.JsonRpcProvider(
         this.config.get('BSC_RPC_URL') || 'https://bsc-dataseed.binance.org/',
-        {
-          name: 'binance',
-          chainId: 56,
-        },
+        { name: 'binance', chainId: 56 },
       );
 
       this.wallet = new ethers.Wallet(privateKey, this.provider);
@@ -121,7 +116,6 @@ export class PredictionService implements OnModuleInit {
 
     this.baseBetAmount =
       (await this.contract.minBetAmount()) * this.BASE_BET_MULTIPLIER;
-    this.currentBetAmount = this.baseBetAmount;
     this.logger.log(
       `Min bet amount: ${ethers.formatEther(this.baseBetAmount)} BNB`,
     );
@@ -130,16 +124,13 @@ export class PredictionService implements OnModuleInit {
   private listenToEvents() {
     this.contract.on('LockRound', async (epoch, price) => {
       const round = await this.getRoundData(epoch);
-
-      // Добавляем информацию о выплатах
       const total = BigInt(round.totalAmount);
-
-      const treasuryFee = (total * BigInt(300n)) / 10000n;
+      const treasuryFee = (total * 300n) / 10000n;
       const prizePool = total - treasuryFee;
       const bullPayout =
-        round.bullAmount > 0n ? prizePool / BigInt(round.bullAmount) : 0n;
+        round.bullAmount > 0n ? prizePool / round.bullAmount : 0n;
       const bearPayout =
-        round.bearAmount > 0n ? prizePool / BigInt(round.bearAmount) : 0n;
+        round.bearAmount > 0n ? prizePool / round.bearAmount : 0n;
 
       const message =
         `🔒 Round #${epoch} locked at ${ethers.formatEther(price)}\n` +
@@ -183,21 +174,20 @@ export class PredictionService implements OnModuleInit {
   private startBnbPriceUpdater(): void {
     setInterval(async () => {
       await this.updateBnbPrice();
-    }, 60_000); // Обновление курса каждую минуту
-    this.updateBnbPrice(); // Первоначальное обновление
+    }, 60_000);
+    this.updateBnbPrice();
   }
 
   private startDailyReset(): void {
     const now = new Date();
     const nextReset = new Date(now);
-    nextReset.setUTCHours(24, 0, 0, 0); // Сброс в 00:00 UTC
+    nextReset.setUTCHours(24, 0, 0, 0);
 
     const initialDelay = nextReset.getTime() - now.getTime();
 
     this.dailyResetTimer = setTimeout(() => {
       this.dailyPnL = 0;
       this.sendTelegramMessage('🔄 Daily PnL reset to $0.00');
-      // Повторяем каждый день
       setInterval(() => {
         this.dailyPnL = 0;
         this.sendTelegramMessage('🔄 Daily PnL reset to $0.00');
@@ -216,6 +206,10 @@ export class PredictionService implements OnModuleInit {
       const isWin = this.checkSingleBetResult(bet, round);
       const resultEmoji = isWin ? '✅' : '❌';
 
+      // Calculate USD value of bet
+      const betAmountUsd =
+        parseFloat(ethers.formatEther(bet.amount)) * this.currentBnbPrice;
+
       if (isWin) {
         const reward = await this.calculateReward(bet);
         const usdReward = reward * this.currentBnbPrice;
@@ -223,6 +217,14 @@ export class PredictionService implements OnModuleInit {
 
         this.sendTelegramMessage(
           `📈 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
+            `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
+        );
+      } else {
+        // Decrement PnL when bet loses - subtract the bet amount
+        this.dailyPnL -= betAmountUsd;
+
+        this.sendTelegramMessage(
+          `📉 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
             `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
         );
       }
@@ -234,25 +236,26 @@ export class PredictionService implements OnModuleInit {
 
       this.sendTelegramMessage(message);
 
-      // Обновление статуса ставки и потока
       if (isWin) {
         await this.claimSingleBet(bet);
         stream.currentAmount = this.baseBetAmount;
         stream.lossCount = 0;
       } else {
-        stream.currentAmount =
-          (stream.currentAmount * this.LOSS_MULTIPLIER) / 10n;
         stream.lossCount++;
+        // Увеличиваем ставку только после 3 проигрышей подряд
+        if (stream.lossCount >= 3) {
+          stream.currentAmount =
+            (stream.currentAmount * this.LOSS_MULTIPLIER) / 10n;
+          stream.lossCount = 0; // Сбрасываем счетчик после увеличения
+        }
       }
 
-      // Обновление истории позиций
       stream.positionHistory = [
         ...stream.positionHistory.slice(-4),
         bet.position,
       ];
     }
 
-    // Отправка обновленного статуса потоков
     const streamsStatus = this.activeStreams
       .map(
         (stream) =>
@@ -276,7 +279,7 @@ export class PredictionService implements OnModuleInit {
         ),
       );
 
-      const treasuryFee = totalAmount * 0.03; // 3% fee
+      const treasuryFee = totalAmount * 0.03;
       const rewardPool = totalAmount - treasuryFee;
       const payout = rewardPool / positionAmount;
 
@@ -314,7 +317,6 @@ export class PredictionService implements OnModuleInit {
 
   private checkSingleBetResult(bet: BetHistory, round: Round): boolean {
     if (!round.oracleCalled) return false;
-
     return (
       (bet.position === 'Bull' && round.closePrice > round.lockPrice) ||
       (bet.position === 'Bear' && round.closePrice < round.lockPrice)
@@ -335,7 +337,6 @@ export class PredictionService implements OnModuleInit {
           : currentRound;
 
         if (this.isBettable(bettingRound)) {
-          // Выбираем поток для ставки
           const stream = this.selectStreamForBet(bettingRound.epoch);
           if (stream) {
             await this.placeBet(bettingRound.epoch, stream);
@@ -356,25 +357,14 @@ export class PredictionService implements OnModuleInit {
         !this.betHistory.some(
           (b) => b.epoch === epoch && b.streamId === stream.id,
         );
-
-      this.logger.debug(`Stream #${stream.id} available: ${isAvailable}`);
       return isAvailable;
     });
 
-    if (availableStreams.length === 0) {
-      this.logger.debug('No available streams');
-      return null;
-    }
+    if (availableStreams.length === 0) return null;
 
-    // Чередование потоков по модулю
     const selectedIndex = this.lastUsedStreamIndex % availableStreams.length;
     this.lastUsedStreamIndex++;
-    const selectedStream = availableStreams[selectedIndex];
-
-    this.logger.debug(
-      `Selected stream #${selectedStream.id} for epoch ${epoch}`,
-    );
-    return selectedStream;
+    return availableStreams[selectedIndex];
   }
 
   private isRoundBettable(round: Round): boolean {
@@ -388,8 +378,6 @@ export class PredictionService implements OnModuleInit {
 
   private isBettable(round: Round): boolean {
     const now = Math.floor(Date.now() / 1000);
-
-    // Делаем ставку за 11 сек до конца раунда
     return (
       now >= round.lockTimestamp - 11 &&
       now < round.lockTimestamp &&
@@ -455,13 +443,11 @@ export class PredictionService implements OnModuleInit {
   }
 
   private calculateBetPosition(round: Round): 'Bull' | 'Bear' {
-    // Выбираем направление с меньшим объемом ставок для лучшего коэффициента
     return round.bullAmount < round.bearAmount ? 'Bull' : 'Bear';
   }
 
   private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
     const balance = await this.provider.getBalance(this.wallet.address);
-
     if (balance < betAmount) {
       this.sendTelegramMessage(
         `⚠️ Insufficient balance for bet: ${ethers.formatEther(betAmount)} BNB`,
