@@ -47,10 +47,7 @@ export class PredictionService implements OnModuleInit {
   private wallet: ethers.Wallet;
   private contract: ethers.Contract;
   private baseBetAmount: bigint;
-  private lastBetPosition: 'Bull' | 'Bear' | null = null;
-  private lastBetEpoch: number | null = null;
   private betHistory: BetHistory[] = [];
-  private readonly WIN_STREAK_TO_CLAIM = 3;
   private activeStreams: BetStream[] = [];
   private readonly MAX_STREAMS = 2;
   private lastUsedStreamIndex = 0;
