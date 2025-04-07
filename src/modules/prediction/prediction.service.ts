@@ -41,6 +41,7 @@ interface BetHistory {
 export class PredictionService implements OnModuleInit {
   private readonly LOSS_MULTIPLIER = 21n; // 2.1x
   private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
+  private readonly BET_SECONDS_BEFORE_END = 5;
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
@@ -379,7 +380,7 @@ export class PredictionService implements OnModuleInit {
   private isBettable(round: Round): boolean {
     const now = Math.floor(Date.now() / 1000);
     return (
-      now >= round.lockTimestamp - 11 &&
+      now >= round.lockTimestamp - this.BET_SECONDS_BEFORE_END &&
       now < round.lockTimestamp &&
       this.isRoundBettable(round) &&
       !this.hasExistingBet(round.epoch)
