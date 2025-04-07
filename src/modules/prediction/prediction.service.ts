@@ -299,13 +299,20 @@ export class PredictionService implements OnModuleInit {
       await tx.wait();
 
       bet.claimed = true;
-      const reward = await this.calculateReward(bet);
-      const usdReward = reward * this.currentBnbPrice;
-      this.dailyPnL += usdReward;
+      const totalReward = await this.calculateReward(bet);
+
+      // Вычисляем чистую прибыль
+      const betAmountBnb = parseFloat(ethers.formatEther(bet.amount));
+      const netProfitBnb = totalReward - betAmountBnb;
+      const netProfitUsd = netProfitBnb * this.currentBnbPrice;
+
+      // Добавляем к PnL только чистую прибыль
+      this.dailyPnL += netProfitUsd;
 
       this.sendTelegramMessage(
         `🏆 Claimed reward for round ${bet.epoch}\n` +
-          `💰 Reward: $${usdReward.toFixed(2)}\n` +
+          `💰 Total Reward: $${(totalReward * this.currentBnbPrice).toFixed(2)}\n` +
+          `💹 Net Profit: $${netProfitUsd.toFixed(2)} (${netProfitBnb.toFixed(6)} BNB)\n` +
           `📈 Total Daily PnL: $${this.dailyPnL.toFixed(2)}\n` +
           `Tx: ${tx.hash}`,
       );
