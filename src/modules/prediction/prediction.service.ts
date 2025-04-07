@@ -243,8 +243,8 @@ export class PredictionService implements OnModuleInit {
         stream.lossCount = 0;
       } else {
         stream.lossCount++;
-        // Увеличиваем ставку только после 3 проигрышей подряд
-        if (stream.lossCount >= 3) {
+        // Увеличиваем ставку только после 2 проигрышей подряд
+        if (stream.lossCount >= 2) {
           stream.currentAmount =
             (stream.currentAmount * this.LOSS_MULTIPLIER) / 10n;
           stream.lossCount = 0; // Сбрасываем счетчик после увеличения
