@@ -27,11 +27,14 @@ interface BetStream {
   lossCount: number;
   lastEpoch: number | null;
   positionHistory: Array<'Bull' | 'Bear'>;
-  consecutiveLosses: number; // Добавленное поле для отслеживания последовательных проигрышей
-  active: boolean; // Флаг активности стрима
-  winCount: number; // Добавленное поле для отслеживания побед
-  totalBets: number; // Общее количество ставок
-  totalWins: number; // Общее количество побед
+  consecutiveLosses: number;
+  maxConsecutiveLosses: number; // Максимальный лузстрик за всё время
+  dailyMaxConsecutiveLosses: number; // Максимальный лузстрик за текущий день
+  active: boolean;
+  winCount: number;
+  totalBets: number;
+  totalWins: number;
+  recoveryMode: boolean; // Режим восстановления после серии проигрышей
 }
 
 interface BetHistory {
@@ -42,9 +45,22 @@ interface BetHistory {
   streamId: number;
 }
 
+// Конфигурация стратегии
+enum StrategyType {
+  FIXED_PERCENTAGE = 'fixed_percentage',
+  MODIFIED_MARTINGALE = 'modified_martingale',
+}
+
 @Injectable()
 export class PredictionService implements OnModuleInit {
-  private readonly BASE_LOSS_MULTIPLIER = 21n; // 2.1x базовый множитель
+  // Конфигурация стратегии
+  private readonly STRATEGY_TYPE: StrategyType =
+    StrategyType.MODIFIED_MARTINGALE; // Выбор стратегии
+  private readonly FLAT_BET_COUNT = 3; // Количество ставок одинакового размера перед увеличением
+  private readonly MARTINGALE_MULTIPLIER = 21n; // Множитель для мартингейла (2.1x)
+  private readonly FIXED_PERCENTAGE = 3; // Процент от баланса для фиксированной стратегии
+  private readonly MAX_RISK_PERCENTAGE = 5; // Максимальный процент от баланса на одну ставку для ограничения риска
+
   private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
   private readonly BET_SECONDS_BEFORE_END = 8;
   private readonly logger = new Logger(PredictionService.name);
@@ -61,13 +77,13 @@ export class PredictionService implements OnModuleInit {
   private dailyResetTimer: NodeJS.Timeout;
   private currentBnbPrice: number = 0;
 
-  // Новые настройки для улучшения стратегии
-  private readonly MAX_CONSECUTIVE_LOSSES = 10; // Максимальное количество проигрышей подряд перед остановкой
-  private readonly MAX_BET_PERCENTAGE = 0.07; // Максимальный % от банкролла на одну ставку (7%)
+  // Настройки управления рисками
+  private readonly MAX_CONSECUTIVE_LOSSES = 12; // Максимальное количество проигрышей подряд перед остановкой
   private readonly STREAM_COOLDOWN_ROUNDS = 5; // Количество раундов паузы после остановки стрима
   private streamCooldowns: Record<number, number> = {}; // Отслеживание паузы для стримов
   private maxBetAmount: bigint; // Максимальный размер ставки
   private totalBankroll: bigint; // Текущий размер банкролла
+  private lastDailyReset: Date = new Date(); // Дата последнего сброса дневной статистики
 
   constructor(
     private readonly config: ConfigService,
@@ -85,10 +101,13 @@ export class PredictionService implements OnModuleInit {
       lastEpoch: null,
       positionHistory: [],
       consecutiveLosses: 0,
+      maxConsecutiveLosses: 0,
+      dailyMaxConsecutiveLosses: 0,
       active: true,
       winCount: 0,
       totalBets: 0,
       totalWins: 0,
+      recoveryMode: false,
     }));
 
     // Инициализация текущего банкролла
@@ -102,20 +121,33 @@ export class PredictionService implements OnModuleInit {
     this.startDailyReset();
     this.startBnbPriceUpdater();
     this.startBankrollMonitor();
+
+    // Отправляем информацию о запуске и текущей стратегии
+    this.sendTelegramMessage(
+      `🤖 Prediction Bot Started\n` +
+        `💰 Initial Balance: ${ethers.formatEther(this.totalBankroll)} BNB\n` +
+        `📊 Strategy: ${
+          this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
+            ? `Fixed ${this.FIXED_PERCENTAGE}% of balance`
+            : `Modified Martingale (${this.FLAT_BET_COUNT} flat bets, then ${this.MARTINGALE_MULTIPLIER / 10n}.${this.MARTINGALE_MULTIPLIER % 10n}x)`
+        }\n` +
+        `⚠️ Max risk per bet: ${this.MAX_RISK_PERCENTAGE}% of balance`,
+    );
   }
 
-  // Новый метод для обновления максимального размера ставки
+  // Метод для обновления максимального размера ставки
   private async updateMaxBetAmount() {
     this.totalBankroll = await this.provider.getBalance(this.wallet.address);
     this.maxBetAmount =
-      (this.totalBankroll * BigInt(Math.floor(this.MAX_BET_PERCENTAGE * 100))) /
-      100n;
+      (this.totalBankroll *
+        BigInt(Math.floor(this.MAX_RISK_PERCENTAGE * 100))) /
+      10000n;
     this.logger.log(
       `Updated max bet amount: ${ethers.formatEther(this.maxBetAmount)} BNB`,
     );
   }
 
-  // Новый метод для мониторинга банкролла
+  // Метод для мониторинга банкролла
   private startBankrollMonitor() {
     setInterval(async () => {
       await this.updateMaxBetAmount();
@@ -172,8 +204,9 @@ export class PredictionService implements OnModuleInit {
     // Инициализируем максимальную ставку
     this.totalBankroll = await this.provider.getBalance(this.wallet.address);
     this.maxBetAmount =
-      (this.totalBankroll * BigInt(Math.floor(this.MAX_BET_PERCENTAGE * 100))) /
-      100n;
+      (this.totalBankroll *
+        BigInt(Math.floor(this.MAX_RISK_PERCENTAGE * 100))) /
+      10000n;
     this.logger.log(
       `Max bet amount: ${ethers.formatEther(this.maxBetAmount)} BNB`,
     );
@@ -212,9 +245,10 @@ export class PredictionService implements OnModuleInit {
             );
             if (stream) {
               stream.active = true;
-              stream.currentAmount = this.baseBetAmount;
+              stream.currentAmount = this.calculateBaseBetAmount();
               stream.consecutiveLosses = 0;
               stream.lossCount = 0;
+              stream.recoveryMode = false;
               this.sendTelegramMessage(
                 `🔄 Stream #${streamId} reactivated after cooldown`,
               );
@@ -265,36 +299,70 @@ export class PredictionService implements OnModuleInit {
     const initialDelay = nextReset.getTime() - now.getTime();
 
     this.dailyResetTimer = setTimeout(() => {
-      this.dailyPnL = 0;
-      this.sendTelegramMessage('🔄 Daily PnL reset to $0.00');
+      this.resetDailyStats();
       setInterval(() => {
-        this.dailyPnL = 0;
-        this.sendTelegramMessage('🔄 Daily PnL reset to $0.00');
+        this.resetDailyStats();
       }, 86_400_000);
     }, initialDelay);
   }
 
-  // Метод для расчета адаптивного множителя
-  private calculateAdaptiveMultiplier(stream: BetStream): bigint {
-    if (stream.totalBets < 10) {
-      // Недостаточно данных, используем базовый множитель
-      return this.BASE_LOSS_MULTIPLIER;
-    }
+  private resetDailyStats(): void {
+    this.dailyPnL = 0;
+    this.lastDailyReset = new Date();
 
-    // Рассчитываем винрейт (0-100)
-    const winRate = (stream.totalWins * 100) / stream.totalBets;
+    // Сбрасываем дневную статистику лузстриков
+    this.activeStreams.forEach((stream) => {
+      stream.dailyMaxConsecutiveLosses = 0;
+    });
 
-    // Адаптивная логика:
-    // - Если винрейт высокий (>55%), можно использовать более агрессивный множитель
-    // - Если винрейт низкий (<45%), используем более консервативный множитель
-    // - В остальных случаях используем стандартный множитель
+    this.sendTelegramMessage('🔄 Daily stats reset');
+  }
 
-    if (winRate > 55) {
-      return this.BASE_LOSS_MULTIPLIER + 2n; // 2.3x для высокого винрейта
-    } else if (winRate < 45) {
-      return this.BASE_LOSS_MULTIPLIER - 3n; // 1.8x для низкого винрейта
+  // Новый метод для расчета базовой ставки в зависимости от стратегии
+  private calculateBaseBetAmount(): bigint {
+    if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
+      // Для стратегии с фиксированным процентом, используем процент от баланса
+      return (
+        (this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n
+      );
     } else {
-      return this.BASE_LOSS_MULTIPLIER; // 2.1x стандартный
+      // Для модифицированной мартингейл стратегии используем базовую ставку
+      return this.baseBetAmount;
+    }
+  }
+
+  // Метод для расчета следующей ставки в зависимости от стратегии
+  private calculateNextBetAmount(stream: BetStream): bigint {
+    // Базовая ставка в зависимости от стратегии
+    const baseAmount = this.calculateBaseBetAmount();
+
+    if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
+      // Всегда фиксированный процент от текущего баланса
+      return baseAmount;
+    } else {
+      // Модифицированная мартингейл стратегия
+      if (stream.lossCount < this.FLAT_BET_COUNT) {
+        // Первые N (FLAT_BET_COUNT) ставок одинакового размера
+        return baseAmount;
+      } else {
+        // После N проигрышей применяем множитель
+        let nextAmount = baseAmount;
+        // Каждая FLAT_BET_COUNT ставок увеличиваем множитель
+        const multiplierSteps = Math.floor(
+          (stream.lossCount - this.FLAT_BET_COUNT) / 1,
+        );
+
+        for (let i = 0; i < multiplierSteps; i++) {
+          nextAmount = (nextAmount * this.MARTINGALE_MULTIPLIER) / 10n;
+        }
+
+        // Проверяем, не превышает ли ставка максимально допустимый размер
+        if (nextAmount > this.maxBetAmount) {
+          nextAmount = this.maxBetAmount;
+        }
+
+        return nextAmount;
+      }
     }
   }
 
@@ -320,6 +388,9 @@ export class PredictionService implements OnModuleInit {
         stream.totalWins++;
         stream.winCount++;
         stream.consecutiveLosses = 0;
+        // Выходим из режима восстановления после выигрыша
+        stream.recoveryMode = false;
+
         const reward = await this.calculateReward(bet);
         const usdReward = reward * this.currentBnbPrice;
         this.dailyPnL += usdReward;
@@ -332,13 +403,23 @@ export class PredictionService implements OnModuleInit {
         stream.consecutiveLosses++;
         stream.winCount = 0;
 
+        // Обновляем статистику максимальных лузстриков
+        if (stream.consecutiveLosses > stream.maxConsecutiveLosses) {
+          stream.maxConsecutiveLosses = stream.consecutiveLosses;
+        }
+
+        if (stream.consecutiveLosses > stream.dailyMaxConsecutiveLosses) {
+          stream.dailyMaxConsecutiveLosses = stream.consecutiveLosses;
+        }
+
         // Проверка на максимальное количество последовательных проигрышей
         if (stream.consecutiveLosses >= this.MAX_CONSECUTIVE_LOSSES) {
           stream.active = false;
+          stream.recoveryMode = true;
           this.streamCooldowns[stream.id] = this.STREAM_COOLDOWN_ROUNDS;
           this.sendTelegramMessage(
             `⚠️ Stream #${stream.id} deactivated due to ${stream.consecutiveLosses} consecutive losses.\n` +
-              `Will be reactivated after ${this.STREAM_COOLDOWN_ROUNDS} rounds.`,
+              `Will be reactivated after ${this.STREAM_COOLDOWN_ROUNDS} rounds in recovery mode.`,
           );
         }
 
@@ -354,39 +435,32 @@ export class PredictionService implements OnModuleInit {
       const message =
         `${resultEmoji} Stream #${stream.id} ${isWin ? 'WON' : 'LOST'} round #${epoch}\n` +
         `💰 Bet: ${ethers.formatEther(bet.amount)} BNB on ${bet.position}\n` +
-        `📉 Loss Streak: ${stream.lossCount}/${stream.consecutiveLosses}\n` +
+        `📉 Current Loss Streak: ${stream.consecutiveLosses}\n` +
+        `⛓️ Daily Max Loss Streak: ${stream.dailyMaxConsecutiveLosses}\n` +
+        `🔗 All-Time Max Loss Streak: ${stream.maxConsecutiveLosses}\n` +
         `📊 Win Rate: ${((stream.totalWins / stream.totalBets) * 100).toFixed(1)}% (${stream.totalWins}/${stream.totalBets})`;
 
       this.sendTelegramMessage(message);
 
       if (isWin) {
         await this.claimSingleBet(bet);
-        stream.currentAmount = this.baseBetAmount;
+        // Сбрасываем ставку к базовой после выигрыша
+        stream.currentAmount = this.calculateBaseBetAmount();
         stream.lossCount = 0;
       } else {
         stream.lossCount++;
-        // Увеличиваем ставку только после 2 проигрышей подряд
-        if (stream.lossCount >= 2) {
-          // Используем адаптивный множитель вместо фиксированного
-          const adaptiveMultiplier = this.calculateAdaptiveMultiplier(stream);
-          stream.currentAmount =
-            (stream.currentAmount * adaptiveMultiplier) / 10n;
+        // Рассчитываем следующую ставку по выбранной стратегии
+        stream.currentAmount = this.calculateNextBetAmount(stream);
 
-          // Проверяем, не превышает ли новая ставка максимально допустимую
-          if (stream.currentAmount > this.maxBetAmount) {
-            stream.currentAmount = this.maxBetAmount;
-            this.sendTelegramMessage(
-              `⚠️ Stream #${stream.id} bet size capped at ${ethers.formatEther(this.maxBetAmount)} BNB (${this.MAX_BET_PERCENTAGE * 100}% of bankroll)`,
-            );
-          }
-
-          this.sendTelegramMessage(
-            `🔄 Stream #${stream.id} using multiplier: ${adaptiveMultiplier / 10n}.${adaptiveMultiplier % 10n}x\n` +
-              `New bet size: ${ethers.formatEther(stream.currentAmount)} BNB`,
-          );
-
-          stream.lossCount = 0; // Сбрасываем счетчик после увеличения
-        }
+        // Логирование информации о следующей ставке
+        this.sendTelegramMessage(
+          `🔄 Stream #${stream.id} next bet size: ${ethers.formatEther(stream.currentAmount)} BNB\n` +
+            `Strategy: ${
+              this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
+                ? 'Fixed Percentage'
+                : `Modified Martingale (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT})`
+            }`,
+        );
       }
 
       stream.positionHistory = [
@@ -399,7 +473,9 @@ export class PredictionService implements OnModuleInit {
       .map(
         (stream) =>
           `📊 Stream #${stream.id}: ${ethers.formatEther(stream.currentAmount)} BNB\n` +
-          `📉 Losses: ${stream.lossCount}/${stream.consecutiveLosses}\n` +
+          `📉 Current Losses: ${stream.consecutiveLosses}\n` +
+          `⛓️ Daily Max Loss Streak: ${stream.dailyMaxConsecutiveLosses}\n` +
+          `🔗 All-Time Max Loss Streak: ${stream.maxConsecutiveLosses}\n` +
           `🏆 Win Rate: ${((stream.totalWins / stream.totalBets) * 100).toFixed(1)}%\n` +
           `🚦 Status: ${stream.active ? 'Active' : 'Cooldown: ' + this.streamCooldowns[stream.id] + ' rounds'}`,
       )
@@ -601,8 +677,19 @@ export class PredictionService implements OnModuleInit {
         stream.lastEpoch = epoch;
 
         await tx.wait(1);
+
+        // Расширенная информация о ставке с добавлением USD стоимости
+        const betAmountUsd =
+          parseFloat(ethers.formatEther(stream.currentAmount)) *
+          this.currentBnbPrice;
         this.sendTelegramMessage(
-          `🎲 Stream #${stream.id} bet ${ethers.formatEther(stream.currentAmount)} BNB on ${position} (#${epoch}) | Tx: ${tx.hash}`,
+          `🎲 Stream #${stream.id} bet ${ethers.formatEther(stream.currentAmount)} BNB ($${betAmountUsd.toFixed(2)}) on ${position} (#${epoch})\n` +
+            `📊 Strategy: ${
+              this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
+                ? `Fixed ${this.FIXED_PERCENTAGE}% of balance`
+                : `Modified Martingale (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT})`
+            }\n` +
+            `📈 Round #${epoch} | Tx: ${tx.hash}`,
         );
       } catch (error) {
         this.sendTelegramMessage(
@@ -613,7 +700,22 @@ export class PredictionService implements OnModuleInit {
   }
 
   private calculateBetPosition(round: Round): 'Bull' | 'Bear' {
-    return round.bullAmount < round.bearAmount ? 'Bull' : 'Bear';
+    // Улучшенная логика выбора позиции с учетом пропорций и минимального порога
+    const bullAmount = Number(ethers.formatEther(round.bullAmount));
+    const bearAmount = Number(ethers.formatEther(round.bearAmount));
+    const totalAmount = bullAmount + bearAmount;
+
+    // Если общая сумма ставок меньше минимального порога, выбираем случайно
+    const MIN_VOLUME_THRESHOLD = 0.5; // BNB
+    if (totalAmount < MIN_VOLUME_THRESHOLD) {
+      return Math.random() < 0.5 ? 'Bull' : 'Bear';
+    }
+
+    // Вычисляем соотношение ставок
+    const bullPercentage = (bullAmount / totalAmount) * 100;
+
+    // Выбираем позицию с меньшей суммой ставок для лучшего соотношения риск/награда
+    return bullPercentage < 50 ? 'Bull' : 'Bear';
   }
 
   private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
@@ -631,6 +733,78 @@ export class PredictionService implements OnModuleInit {
     this.telegramService.sendMessage(
       this.config.get('RECEIVER_TELEGRAM_ID'),
       message,
+    );
+  }
+
+  // Добавим метод для получения статистики по стримам
+  async getStreamStats(): Promise<string> {
+    const now = new Date();
+    const daysSinceReset = Math.floor(
+      (now.getTime() - this.lastDailyReset.getTime()) / (1000 * 3600 * 24),
+    );
+    const hoursSinceReset =
+      Math.floor(
+        (now.getTime() - this.lastDailyReset.getTime()) / (1000 * 3600),
+      ) % 24;
+
+    // Рассчитываем рекомендуемый минимальный баланс на основе максимальных лузстриков
+    const maxLossStreakEver = Math.max(
+      ...this.activeStreams.map((s) => s.maxConsecutiveLosses),
+    );
+
+    // Рассчитываем необходимый баланс для покрытия максимальных лузстриков
+    let requiredBalanceBNB = 0;
+
+    if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
+      // Для фиксированного процента от баланса
+      requiredBalanceBNB =
+        parseFloat(ethers.formatEther(this.baseBetAmount)) * 20; // Примерный запас
+    } else {
+      // Для мартингейла - расчет всех ставок в серии
+      let totalBetAmountForWorstCase = 0;
+      let currentBetAmount = parseFloat(ethers.formatEther(this.baseBetAmount));
+
+      // Расчет для плато из FLAT_BET_COUNT ставок
+      for (let i = 0; i < this.FLAT_BET_COUNT; i++) {
+        totalBetAmountForWorstCase += currentBetAmount;
+      }
+
+      // Расчет для остальных с увеличивающимся множителем
+      for (let i = this.FLAT_BET_COUNT; i < maxLossStreakEver + 2; i++) {
+        currentBetAmount =
+          currentBetAmount * (Number(this.MARTINGALE_MULTIPLIER) / 10);
+        totalBetAmountForWorstCase += currentBetAmount;
+      }
+
+      requiredBalanceBNB = totalBetAmountForWorstCase * 1.2; // +20% запас
+    }
+
+    const requiredBalanceUSD = requiredBalanceBNB * this.currentBnbPrice;
+    const currentBalanceBNB = parseFloat(
+      ethers.formatEther(this.totalBankroll),
+    );
+    const currentBalanceUSD = currentBalanceBNB * this.currentBnbPrice;
+
+    return (
+      `📊 Bot Stats Summary\n\n` +
+      `💰 Current Balance: ${currentBalanceBNB.toFixed(4)} BNB ($${currentBalanceUSD.toFixed(2)})\n` +
+      `⏱️ Stats Age: ${daysSinceReset}d ${hoursSinceReset}h\n` +
+      `📈 Daily PnL: $${this.dailyPnL.toFixed(2)}\n\n` +
+      `🔄 Current Strategy: ${
+        this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
+          ? `Fixed ${this.FIXED_PERCENTAGE}% of balance`
+          : `Modified Martingale (${this.FLAT_BET_COUNT} flat bets, then ${this.MARTINGALE_MULTIPLIER / 10n}.${this.MARTINGALE_MULTIPLIER % 10n}x)`
+      }\n\n` +
+      `⚠️ Max Loss Streaks:\n` +
+      this.activeStreams
+        .map(
+          (s) =>
+            `Stream #${s.id}: ${s.maxConsecutiveLosses} (all-time) / ${s.dailyMaxConsecutiveLosses} (today)`,
+        )
+        .join('\n') +
+      `\n\n` +
+      `💼 Recommended Min Balance: ${requiredBalanceBNB.toFixed(4)} BNB ($${requiredBalanceUSD.toFixed(2)})\n` +
+      `🛡️ Balance Safety: ${((currentBalanceBNB / requiredBalanceBNB) * 100).toFixed(0)}%`
     );
   }
 }
