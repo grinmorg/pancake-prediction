@@ -73,7 +73,7 @@ export class PredictionService implements OnModuleInit {
   private readonly MAX_STREAMS = 2;
   private lastUsedStreamIndex = 0;
 
-  private dailyPnL: number = 0;
+  private initialBankroll: bigint; // Переименуем totalBankroll в currentBankroll для ясности
   private dailyResetTimer: NodeJS.Timeout;
   private currentBnbPrice: number = 0;
 
@@ -112,6 +112,8 @@ export class PredictionService implements OnModuleInit {
 
     // Инициализация текущего банкролла
     this.totalBankroll = await this.provider.getBalance(this.wallet.address);
+    this.initialBankroll = this.totalBankroll; // Инициализация начального банкролла
+
     // Установка максимального размера ставки на основе банкролла
     this.updateMaxBetAmount();
 
@@ -307,7 +309,6 @@ export class PredictionService implements OnModuleInit {
   }
 
   private resetDailyStats(): void {
-    this.dailyPnL = 0;
     this.lastDailyReset = new Date();
 
     // Сбрасываем дневную статистику лузстриков
@@ -383,25 +384,12 @@ export class PredictionService implements OnModuleInit {
       const isWin = this.checkSingleBetResult(bet, round);
       const resultEmoji = isWin ? '✅' : '❌';
 
-      // Calculate USD value of bet
-      const betAmountUsd =
-        parseFloat(ethers.formatEther(bet.amount)) * this.currentBnbPrice;
-
       if (isWin) {
         stream.totalWins++;
         stream.winCount++;
         stream.consecutiveLosses = 0;
         // Выходим из режима восстановления после выигрыша
         stream.recoveryMode = false;
-
-        const reward = await this.calculateReward(bet);
-        const usdReward = reward * this.currentBnbPrice;
-        this.dailyPnL += usdReward;
-
-        this.sendTelegramMessage(
-          `📈 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
-            `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
-        );
       } else {
         stream.consecutiveLosses++;
         stream.winCount = 0;
@@ -425,14 +413,6 @@ export class PredictionService implements OnModuleInit {
               `Will be reactivated after ${this.STREAM_COOLDOWN_ROUNDS} rounds in recovery mode.`,
           );
         }
-
-        // Decrement PnL when bet loses - subtract the bet amount
-        this.dailyPnL -= betAmountUsd;
-
-        this.sendTelegramMessage(
-          `📉 Daily PnL Update: $${this.dailyPnL.toFixed(2)}\n` +
-            `📊 Current BNB Price: $${this.currentBnbPrice.toFixed(2)}`,
-        );
       }
 
       const message =
@@ -537,19 +517,22 @@ export class PredictionService implements OnModuleInit {
       bet.claimed = true;
       const totalReward = await this.calculateReward(bet);
 
-      // Вычисляем чистую прибыль
-      const betAmountBnb = parseFloat(ethers.formatEther(bet.amount));
-      const netProfitBnb = totalReward - betAmountBnb;
-      const netProfitUsd = netProfitBnb * this.currentBnbPrice;
+      // Получаем актуальный баланс после клейма
+      const currentBalance = await this.provider.getBalance(
+        this.wallet.address,
+      );
+      const balanceChange = currentBalance - this.initialBankroll;
 
-      // Добавляем к PnL только чистую прибыль
-      this.dailyPnL += netProfitUsd;
+      // Рассчитываем PnL
+      const pnlUSD =
+        parseFloat(ethers.formatEther(balanceChange)) * this.currentBnbPrice;
 
       this.sendTelegramMessage(
         `🏆 Claimed reward for round ${bet.epoch}\n` +
-          `💰 Total Reward: $${(totalReward * this.currentBnbPrice).toFixed(2)}\n` +
-          `💹 Net Profit: $${netProfitUsd.toFixed(2)} (${netProfitBnb.toFixed(6)} BNB)\n` +
-          `📈 Total Daily PnL: $${this.dailyPnL.toFixed(2)}\n` +
+          `💸 Total Reward: $${(totalReward * this.currentBnbPrice).toFixed(2)}\n` +
+          `💰 Current Balance: ${ethers.formatEther(currentBalance)} BNB\n` +
+          `📈 Total PnL: $${pnlUSD.toFixed(2)}\n` +
+          `🔄 Balance Change: ${ethers.formatEther(balanceChange)} BNB\n` +
           `Tx: ${tx.hash}`,
       );
 
@@ -736,78 +719,6 @@ export class PredictionService implements OnModuleInit {
     this.telegramService.sendMessage(
       this.config.get('RECEIVER_TELEGRAM_ID'),
       message,
-    );
-  }
-
-  // Добавим метод для получения статистики по стримам
-  async getStreamStats(): Promise<string> {
-    const now = new Date();
-    const daysSinceReset = Math.floor(
-      (now.getTime() - this.lastDailyReset.getTime()) / (1000 * 3600 * 24),
-    );
-    const hoursSinceReset =
-      Math.floor(
-        (now.getTime() - this.lastDailyReset.getTime()) / (1000 * 3600),
-      ) % 24;
-
-    // Рассчитываем рекомендуемый минимальный баланс на основе максимальных лузстриков
-    const maxLossStreakEver = Math.max(
-      ...this.activeStreams.map((s) => s.maxConsecutiveLosses),
-    );
-
-    // Рассчитываем необходимый баланс для покрытия максимальных лузстриков
-    let requiredBalanceBNB = 0;
-
-    if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
-      // Для фиксированного процента от баланса
-      requiredBalanceBNB =
-        parseFloat(ethers.formatEther(this.baseBetAmount)) * 20; // Примерный запас
-    } else {
-      // Для мартингейла - расчет всех ставок в серии
-      let totalBetAmountForWorstCase = 0;
-      let currentBetAmount = parseFloat(ethers.formatEther(this.baseBetAmount));
-
-      // Расчет для плато из FLAT_BET_COUNT ставок
-      for (let i = 0; i < this.FLAT_BET_COUNT; i++) {
-        totalBetAmountForWorstCase += currentBetAmount;
-      }
-
-      // Расчет для остальных с увеличивающимся множителем
-      for (let i = this.FLAT_BET_COUNT; i < maxLossStreakEver + 2; i++) {
-        currentBetAmount =
-          currentBetAmount * (Number(this.MARTINGALE_MULTIPLIER) / 10);
-        totalBetAmountForWorstCase += currentBetAmount;
-      }
-
-      requiredBalanceBNB = totalBetAmountForWorstCase * 1.2; // +20% запас
-    }
-
-    const requiredBalanceUSD = requiredBalanceBNB * this.currentBnbPrice;
-    const currentBalanceBNB = parseFloat(
-      ethers.formatEther(this.totalBankroll),
-    );
-    const currentBalanceUSD = currentBalanceBNB * this.currentBnbPrice;
-
-    return (
-      `📊 Bot Stats Summary\n\n` +
-      `💰 Current Balance: ${currentBalanceBNB.toFixed(4)} BNB ($${currentBalanceUSD.toFixed(2)})\n` +
-      `⏱️ Stats Age: ${daysSinceReset}d ${hoursSinceReset}h\n` +
-      `📈 Daily PnL: $${this.dailyPnL.toFixed(2)}\n\n` +
-      `🔄 Current Strategy: ${
-        this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
-          ? `Fixed ${this.FIXED_PERCENTAGE}% of balance`
-          : `Modified Martingale (${this.FLAT_BET_COUNT} flat bets, then ${this.MARTINGALE_MULTIPLIER / 10n}.${this.MARTINGALE_MULTIPLIER % 10n}x)`
-      }\n\n` +
-      `⚠️ Max Loss Streaks:\n` +
-      this.activeStreams
-        .map(
-          (s) =>
-            `Stream #${s.id}: ${s.maxConsecutiveLosses} (all-time) / ${s.dailyMaxConsecutiveLosses} (today)`,
-        )
-        .join('\n') +
-      `\n\n` +
-      `💼 Recommended Min Balance: ${requiredBalanceBNB.toFixed(4)} BNB ($${requiredBalanceUSD.toFixed(2)})\n` +
-      `🛡️ Balance Safety: ${((currentBalanceBNB / requiredBalanceBNB) * 100).toFixed(0)}%`
     );
   }
 }
