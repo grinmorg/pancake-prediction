@@ -59,7 +59,7 @@ export class PredictionService implements OnModuleInit {
   private readonly FLAT_BET_COUNT = 3; // Количество ставок одинакового размера перед увеличением
   private readonly MARTINGALE_MULTIPLIER = 21n; // Множитель для мартингейла (2.1x)
   private readonly FIXED_PERCENTAGE = 3; // Процент от баланса для фиксированной стратегии
-  private readonly MAX_RISK_PERCENTAGE = 5; // Максимальный процент от баланса на одну ставку для ограничения риска
+  private readonly MAX_RISK_PERCENTAGE = 40; // Максимальный процент от баланса на одну ставку для ограничения риска
 
   private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
   private readonly BET_SECONDS_BEFORE_END = 8;
@@ -333,37 +333,40 @@ export class PredictionService implements OnModuleInit {
 
   // Метод для расчета следующей ставки в зависимости от стратегии
   private calculateNextBetAmount(stream: BetStream): bigint {
-    // Базовая ставка в зависимости от стратегии
     const baseAmount = this.calculateBaseBetAmount();
 
     if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
-      // Всегда фиксированный процент от текущего баланса
       return baseAmount;
-    } else {
-      // Модифицированная мартингейл стратегия
-      if (stream.lossCount < this.FLAT_BET_COUNT) {
-        // Первые N (FLAT_BET_COUNT) ставок одинакового размера
-        return baseAmount;
-      } else {
-        // После N проигрышей применяем множитель
-        let nextAmount = baseAmount;
-        // Каждая FLAT_BET_COUNT ставок увеличиваем множитель
-        const multiplierSteps = Math.floor(
-          (stream.lossCount - this.FLAT_BET_COUNT) / 1,
-        );
-
-        for (let i = 0; i < multiplierSteps; i++) {
-          nextAmount = (nextAmount * this.MARTINGALE_MULTIPLIER) / 10n;
-        }
-
-        // Проверяем, не превышает ли ставка максимально допустимый размер
-        if (nextAmount > this.maxBetAmount) {
-          nextAmount = this.maxBetAmount;
-        }
-
-        return nextAmount;
-      }
     }
+
+    if (stream.lossCount >= this.FLAT_BET_COUNT) {
+      const lossStreak = stream.lossCount - this.FLAT_BET_COUNT;
+      let calculatedAmount = baseAmount;
+
+      // Постепенное умножение с проверкой на каждом шаге
+      for (let i = 0; i <= lossStreak; i++) {
+        calculatedAmount =
+          (calculatedAmount * this.MARTINGALE_MULTIPLIER) / 10n;
+
+        // Проверка максимальной ставки
+        if (calculatedAmount > this.maxBetAmount) {
+          return this.maxBetAmount;
+        }
+
+        // Проверка минимального баланса
+        if (calculatedAmount > this.totalBankroll / 10n) {
+          // Не более 10% баланса
+          this.sendTelegramMessage(
+            `⚠️ Stream #${stream.id} reached bankroll protection limit!`,
+          );
+          return this.maxBetAmount;
+        }
+      }
+
+      return calculatedAmount;
+    }
+
+    return baseAmount;
   }
 
   private async handleRoundResult(epoch: number) {
