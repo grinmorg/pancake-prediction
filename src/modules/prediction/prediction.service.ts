@@ -700,8 +700,8 @@ export class PredictionService implements OnModuleInit {
     // Вычисляем соотношение ставок
     const bullPercentage = (bullAmount / totalAmount) * 100;
 
-    // Выбираем позицию с меньшей суммой ставок для лучшего соотношения риск/награда
-    return bullPercentage < 50 ? 'Bull' : 'Bear';
+    // Выбираем позицию с БОЛЬШЕЙ суммой ставок для лучшего соотношения риск/награда (так как боты ставят в последний момент на меньшую)
+    return bullPercentage > 50 ? 'Bull' : 'Bear';
   }
 
   private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
