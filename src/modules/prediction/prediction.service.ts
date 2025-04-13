@@ -62,7 +62,7 @@ export class PredictionService implements OnModuleInit {
   private readonly MAX_RISK_PERCENTAGE = 40; // Максимальный процент от баланса на одну ставку для ограничения риска
 
   private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
-  private readonly BET_SECONDS_BEFORE_END = 8;
+  private readonly BET_SECONDS_BEFORE_END = 5;
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
@@ -700,8 +700,8 @@ export class PredictionService implements OnModuleInit {
     // Вычисляем соотношение ставок
     const bullPercentage = (bullAmount / totalAmount) * 100;
 
-    // Выбираем позицию с БОЛЬШЕЙ суммой ставок для лучшего соотношения риск/награда (так как боты ставят в последний момент на меньшую)
-    return bullPercentage > 50 ? 'Bull' : 'Bear';
+    // Выбираем позицию с меньшей суммой ставок для лучшего соотношения риск/награда
+    return bullPercentage < 50 ? 'Bull' : 'Bear';
   }
 
   private async hasSufficientBalance(betAmount: bigint): Promise<boolean> {
