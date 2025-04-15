@@ -56,7 +56,7 @@ export class PredictionService implements OnModuleInit {
   // Конфигурация стратегии
   private readonly STRATEGY_TYPE: StrategyType =
     StrategyType.MODIFIED_MARTINGALE; // Выбор стратегии
-  private readonly FLAT_BET_COUNT = 3; // Количество ставок одинакового размера перед увеличением
+  private readonly FLAT_BET_COUNT = 2; // Количество ставок одинакового размера перед увеличением + 1
   private readonly MARTINGALE_MULTIPLIER = 21n; // Множитель для мартингейла (2.1x)
   private readonly FIXED_PERCENTAGE = 3; // Процент от баланса для фиксированной стратегии
   private readonly MAX_RISK_PERCENTAGE = 40; // Максимальный процент от баланса на одну ставку для ограничения риска
