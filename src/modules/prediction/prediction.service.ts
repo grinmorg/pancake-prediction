@@ -340,34 +340,43 @@ export class PredictionService implements OnModuleInit {
       return baseAmount;
     }
 
-    if (stream.lossCount >= this.FLAT_BET_COUNT) {
-      const lossStreak = stream.lossCount - this.FLAT_BET_COUNT;
+    if (stream.lossCount < this.FLAT_BET_COUNT) {
+      // Для первых трех проигрышей используем базовую ставку
+      return baseAmount;
+    } else {
+      // Для последующих проигрышей применяем Мартингейл
+      // Рассчитываем, сколько раз нужно умножить (после последнего FLAT)
+      const multiplierPower = Math.floor(
+        (stream.lossCount - this.FLAT_BET_COUNT) / 1,
+      );
+
+      // Начинаем с базовой ставки
       let calculatedAmount = baseAmount;
 
-      // Постепенное умножение с проверкой на каждом шаге
-      for (let i = 0; i <= lossStreak; i++) {
+      // Применяем множитель соответствующее количество раз
+      for (let i = 0; i < multiplierPower; i++) {
         calculatedAmount =
           (calculatedAmount * this.MARTINGALE_MULTIPLIER) / 10n;
+      }
 
-        // Проверка максимальной ставки
-        if (calculatedAmount > this.maxBetAmount) {
-          return this.maxBetAmount;
-        }
+      // Проверка максимальной ставки
+      if (calculatedAmount > this.maxBetAmount) {
+        this.sendTelegramMessage(
+          `⚠️ Stream #${stream.id} reached max bet limit! Using max bet: ${ethers.formatEther(this.maxBetAmount)} BNB`,
+        );
+        return this.maxBetAmount;
+      }
 
-        // Проверка минимального баланса
-        if (calculatedAmount > this.totalBankroll / 10n) {
-          // Не более 10% баланса
-          this.sendTelegramMessage(
-            `⚠️ Stream #${stream.id} reached bankroll protection limit!`,
-          );
-          return this.maxBetAmount;
-        }
+      // Проверка минимального баланса
+      if (calculatedAmount > this.totalBankroll / 10n) {
+        this.sendTelegramMessage(
+          `⚠️ Stream #${stream.id} reached bankroll protection limit!`,
+        );
+        return this.maxBetAmount;
       }
 
       return calculatedAmount;
     }
-
-    return baseAmount;
   }
 
   private async handleRoundResult(epoch: number) {
