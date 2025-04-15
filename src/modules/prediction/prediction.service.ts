@@ -340,7 +340,7 @@ export class PredictionService implements OnModuleInit {
       return baseAmount;
     }
 
-    if (stream.lossCount < this.FLAT_BET_COUNT) {
+    if (stream.lossCount <= this.FLAT_BET_COUNT) {
       // Для первых трех проигрышей используем базовую ставку
       return baseAmount;
     } else {
