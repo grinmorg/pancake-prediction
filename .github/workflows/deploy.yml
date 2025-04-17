@@ -53,10 +53,10 @@ jobs:
             git reset --hard origin/main
 
             # 4. Устанавливаем зависимости
-            /usr/local/bin/pnpm install --frozen-lockfile --prod
+            pnpm install --frozen-lockfile
 
             # 5. Собираем проект
-            /usr/local/bin/pnpm build
+            pnpm build
 
             # 6. Перезапускаем приложение
             sleep 5
