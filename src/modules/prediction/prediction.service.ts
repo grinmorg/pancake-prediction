@@ -55,14 +55,14 @@ enum StrategyType {
 @Injectable()
 export class PredictionService implements OnModuleInit {
   // Конфигурация стратегии
-  private readonly STRATEGY_TYPE: StrategyType = StrategyType.FIBONACCI; // Change this to select the Fibonacci strategy
+  private readonly STRATEGY_TYPE: StrategyType = StrategyType.FIXED_PERCENTAGE; // Change this to select the Fibonacci strategy
   private readonly FLAT_BET_COUNT = 1; // For Fibonacci, can be adjusted to your preference
   private readonly FIBONACCI_SEQUENCE: number[] = [
     1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610,
   ]; // Pre-calculated Fibonacci sequence
 
   private readonly MARTINGALE_MULTIPLIER = 21n; // Множитель для мартингейла (2.1x)
-  private readonly FIXED_PERCENTAGE = 3; // Процент от баланса для фиксированной стратегии
+  private readonly FIXED_PERCENTAGE = 5; // Процент от баланса для фиксированной стратегии
   private readonly MAX_RISK_PERCENTAGE = 40; // Максимальный процент от баланса на одну ставку для ограничения риска
 
   private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
