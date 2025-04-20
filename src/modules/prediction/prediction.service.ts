@@ -49,14 +49,18 @@ interface BetHistory {
 enum StrategyType {
   FIXED_PERCENTAGE = 'fixed_percentage',
   MODIFIED_MARTINGALE = 'modified_martingale',
+  FIBONACCI = 'fibonacci',
 }
 
 @Injectable()
 export class PredictionService implements OnModuleInit {
   // Конфигурация стратегии
-  private readonly STRATEGY_TYPE: StrategyType =
-    StrategyType.MODIFIED_MARTINGALE; // Выбор стратегии
-  private readonly FLAT_BET_COUNT = 2; // Количество ставок одинакового размера перед увеличением + 1
+  private readonly STRATEGY_TYPE: StrategyType = StrategyType.FIBONACCI; // Change this to select the Fibonacci strategy
+  private readonly FLAT_BET_COUNT = 1; // For Fibonacci, can be adjusted to your preference
+  private readonly FIBONACCI_SEQUENCE: number[] = [
+    1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610,
+  ]; // Pre-calculated Fibonacci sequence
+
   private readonly MARTINGALE_MULTIPLIER = 21n; // Множитель для мартингейла (2.1x)
   private readonly FIXED_PERCENTAGE = 3; // Процент от баланса для фиксированной стратегии
   private readonly MAX_RISK_PERCENTAGE = 40; // Максимальный процент от баланса на одну ставку для ограничения риска
@@ -131,7 +135,9 @@ export class PredictionService implements OnModuleInit {
         `📊 Strategy: ${
           this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
             ? `Fixed ${this.FIXED_PERCENTAGE}% of balance`
-            : `Modified Martingale (${this.FLAT_BET_COUNT} flat bets, then ${this.MARTINGALE_MULTIPLIER / 10n}.${this.MARTINGALE_MULTIPLIER % 10n}x)`
+            : this.STRATEGY_TYPE === StrategyType.MODIFIED_MARTINGALE
+              ? `Modified Martingale (${this.FLAT_BET_COUNT} flat bets, then ${this.MARTINGALE_MULTIPLIER / 10n}.${this.MARTINGALE_MULTIPLIER % 10n}x)`
+              : `Fibonacci (${this.FLAT_BET_COUNT} flat bets, then following sequence: ${this.FIBONACCI_SEQUENCE.slice(0, 8).join(', ')}...)`
         }\n` +
         `⚠️ Max risk per bet: ${this.MAX_RISK_PERCENTAGE}% of balance`,
     );
@@ -345,19 +351,33 @@ export class PredictionService implements OnModuleInit {
       return baseAmount;
     }
 
-    // Starting from 4th loss (lossCount >= 4) apply multiplier 2.1x
-    const lossStreak = stream.lossCount - this.FLAT_BET_COUNT;
+    if (this.STRATEGY_TYPE === StrategyType.FIBONACCI) {
+      // Calculate which Fibonacci number to use based on loss streak
+      const fibIndex = Math.min(
+        stream.lossCount - this.FLAT_BET_COUNT - 1,
+        this.FIBONACCI_SEQUENCE.length - 1,
+      );
 
-    // Calculate multiplier: 2.1x for each subsequent loss
-    let calculatedAmount = baseAmount;
-    for (let i = 0; i < lossStreak; i++) {
-      calculatedAmount = (calculatedAmount * this.MARTINGALE_MULTIPLIER) / 10n;
+      // Multiply base amount by the corresponding Fibonacci number
+      const calculatedAmount =
+        baseAmount * BigInt(this.FIBONACCI_SEQUENCE[fibIndex]);
+
+      // Check maximum bet
+      return calculatedAmount > this.maxBetAmount
+        ? this.maxBetAmount
+        : calculatedAmount;
+    } else {
+      // Existing Modified Martingale logic
+      const lossStreak = stream.lossCount - this.FLAT_BET_COUNT;
+      let calculatedAmount = baseAmount;
+      for (let i = 0; i < lossStreak; i++) {
+        calculatedAmount =
+          (calculatedAmount * this.MARTINGALE_MULTIPLIER) / 10n;
+      }
+      return calculatedAmount > this.maxBetAmount
+        ? this.maxBetAmount
+        : calculatedAmount;
     }
-
-    // Check maximum bet
-    return calculatedAmount > this.maxBetAmount
-      ? this.maxBetAmount
-      : calculatedAmount;
   }
 
   private async handleRoundResult(epoch: number) {
@@ -431,7 +451,9 @@ export class PredictionService implements OnModuleInit {
             `Strategy: ${
               this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
                 ? 'Fixed Percentage'
-                : `Modified Martingale (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT})`
+                : this.STRATEGY_TYPE === StrategyType.MODIFIED_MARTINGALE
+                  ? `Modified Martingale (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT})`
+                  : `Fibonacci (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT}, Sequence position: ${Math.min(stream.lossCount - this.FLAT_BET_COUNT - 1, this.FIBONACCI_SEQUENCE.length - 1) + 1})`
             }`,
         );
       }
@@ -663,7 +685,9 @@ export class PredictionService implements OnModuleInit {
             `📊 Strategy: ${
               this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
                 ? `Fixed ${this.FIXED_PERCENTAGE}% of balance`
-                : `Modified Martingale (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT})`
+                : this.STRATEGY_TYPE === StrategyType.MODIFIED_MARTINGALE
+                  ? `Modified Martingale (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT})`
+                  : `Fibonacci (Loss count: ${stream.lossCount}/${this.FLAT_BET_COUNT}, Sequence position: ${Math.min(stream.lossCount - this.FLAT_BET_COUNT - 1, this.FIBONACCI_SEQUENCE.length - 1) + 1})`
             }\n` +
             `📈 Round #${epoch} | Tx: ${tx.hash}`,
         );
