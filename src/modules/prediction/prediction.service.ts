@@ -161,7 +161,14 @@ export class PredictionService implements OnModuleInit {
   // Метод для мониторинга банкролла
   private startBankrollMonitor() {
     setInterval(async () => {
-      await this.updateMaxBetAmount();
+      if (this.STRATEGY_TYPE != StrategyType.FIXED_PERCENTAGE) {
+        await this.updateMaxBetAmount();
+      } else {
+        // update total balance
+        this.totalBankroll = await this.provider.getBalance(
+          this.wallet.address,
+        );
+      }
 
       const balanceBNB = ethers.formatEther(this.totalBankroll);
       const balanceUSD = parseFloat(balanceBNB) * this.currentBnbPrice;
