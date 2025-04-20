@@ -66,7 +66,7 @@ export class PredictionService implements OnModuleInit {
   private readonly MAX_RISK_PERCENTAGE = 40; // Максимальный процент от баланса на одну ставку для ограничения риска
 
   private readonly BASE_BET_MULTIPLIER = 5n; // 1x - min bet usually 0.6$
-  private readonly BET_SECONDS_BEFORE_END = 5;
+  private readonly BET_SECONDS_BEFORE_END = 3;
   private readonly logger = new Logger(PredictionService.name);
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
