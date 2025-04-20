@@ -327,7 +327,13 @@ export class PredictionService implements OnModuleInit {
 
   // Новый метод для расчета базовой ставки в зависимости от стратегии
   private calculateBaseBetAmount(): bigint {
+    this.sendTelegramMessage(
+      `Test: ${this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE ? 'yes' : 'no'}`,
+    );
     if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
+      this.sendTelegramMessage(
+        `Current bet: ${(this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n}`,
+      );
       // Для стратегии с фиксированным процентом, используем процент от баланса
       return (
         (this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n
