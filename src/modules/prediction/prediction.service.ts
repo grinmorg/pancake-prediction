@@ -130,7 +130,7 @@ export class PredictionService implements OnModuleInit {
 
     // Отправляем информацию о запуске и текущей стратегии
     this.sendTelegramMessage(
-      `🤖 Prediction Bot v1 Started\n` +
+      `🤖 Prediction Bot v2 Started\n` +
         `💰 Initial Balance: ${ethers.formatEther(this.totalBankroll)} BNB\n` +
         `📊 Strategy: ${
           this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
