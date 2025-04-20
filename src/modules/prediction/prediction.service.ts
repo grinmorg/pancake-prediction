@@ -100,7 +100,10 @@ export class PredictionService implements OnModuleInit {
 
     this.activeStreams = Array.from({ length: this.MAX_STREAMS }, (_, i) => ({
       id: i + 1,
-      currentAmount: this.baseBetAmount,
+      currentAmount:
+        this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
+          ? this.calculateBaseBetAmount()
+          : this.baseBetAmount,
       lossCount: 0,
       lastEpoch: null,
       positionHistory: [],
@@ -130,7 +133,7 @@ export class PredictionService implements OnModuleInit {
 
     // Отправляем информацию о запуске и текущей стратегии
     this.sendTelegramMessage(
-      `🤖 Prediction Bot v2 Started\n` +
+      `🤖 Prediction Bot v3 Started\n` +
         `💰 Initial Balance: ${ethers.formatEther(this.totalBankroll)} BNB\n` +
         `📊 Strategy: ${
           this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
@@ -327,13 +330,7 @@ export class PredictionService implements OnModuleInit {
 
   // Новый метод для расчета базовой ставки в зависимости от стратегии
   private calculateBaseBetAmount(): bigint {
-    this.sendTelegramMessage(
-      `Test: ${this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE ? 'yes' : 'no'}`,
-    );
     if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
-      this.sendTelegramMessage(
-        `Current bet: ${(this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n}`,
-      );
       // Для стратегии с фиксированным процентом, используем процент от баланса
       return (
         (this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n
