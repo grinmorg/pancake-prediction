@@ -97,12 +97,13 @@ export class PredictionService implements OnModuleInit {
   async onModuleInit() {
     await this.initializeProvider();
     await this.initializeContract();
+    const calculatedBaseBetAmount = await this.calculateBaseBetAmount();
 
     this.activeStreams = Array.from({ length: this.MAX_STREAMS }, (_, i) => ({
       id: i + 1,
       currentAmount:
         this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE
-          ? this.calculateBaseBetAmount()
+          ? calculatedBaseBetAmount
           : this.baseBetAmount,
       lossCount: 0,
       lastEpoch: null,
@@ -254,7 +255,7 @@ export class PredictionService implements OnModuleInit {
       );
 
       // Уменьшаем cooldown для остановленных стримов
-      Object.keys(this.streamCooldowns).forEach((streamId) => {
+      Object.keys(this.streamCooldowns).forEach(async (streamId) => {
         if (this.streamCooldowns[streamId] > 0) {
           this.streamCooldowns[streamId]--;
           if (this.streamCooldowns[streamId] === 0) {
@@ -263,7 +264,7 @@ export class PredictionService implements OnModuleInit {
             );
             if (stream) {
               stream.active = true;
-              stream.currentAmount = this.calculateBaseBetAmount();
+              stream.currentAmount = await this.calculateBaseBetAmount();
               stream.consecutiveLosses = 0;
               stream.lossCount = 0;
               stream.recoveryMode = false;
@@ -336,12 +337,23 @@ export class PredictionService implements OnModuleInit {
   }
 
   // Новый метод для расчета базовой ставки в зависимости от стратегии
-  private calculateBaseBetAmount(): bigint {
+  private async calculateBaseBetAmount(): Promise<bigint> {
     if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
+      // Обновляем общий баланс
+      this.totalBankroll = await this.provider.getBalance(this.wallet.address);
+
       // Для стратегии с фиксированным процентом, используем процент от баланса
-      return (
-        (this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n
-      );
+      const rawAmount =
+        (this.totalBankroll *
+          BigInt(Math.floor(this.FIXED_PERCENTAGE * 10000))) /
+        10000n;
+
+      // Добавляем 1 к числу, если есть остаток от деления (это округлит вверх)
+      const remainder =
+        (this.totalBankroll *
+          BigInt(Math.floor(this.FIXED_PERCENTAGE * 10000))) %
+        10000n;
+      return remainder > 0n ? rawAmount + 1n : rawAmount;
     } else {
       // Для модифицированной мартингейл стратегии используем базовую ставку
       return this.baseBetAmount;
@@ -349,8 +361,8 @@ export class PredictionService implements OnModuleInit {
   }
 
   // Метод для расчета следующей ставки в зависимости от стратегии
-  private calculateNextBetAmount(stream: BetStream): bigint {
-    const baseAmount = this.calculateBaseBetAmount();
+  private async calculateNextBetAmount(stream: BetStream): Promise<bigint> {
+    const baseAmount = await this.calculateBaseBetAmount();
 
     if (this.STRATEGY_TYPE === StrategyType.FIXED_PERCENTAGE) {
       return baseAmount;
@@ -448,12 +460,12 @@ export class PredictionService implements OnModuleInit {
       if (isWin) {
         await this.claimSingleBet(bet);
         // Сбрасываем ставку к базовой после выигрыша
-        stream.currentAmount = this.calculateBaseBetAmount();
+        stream.currentAmount = await this.calculateBaseBetAmount();
         stream.lossCount = 0;
       } else {
         stream.lossCount++;
         // Рассчитываем следующую ставку по выбранной стратегии
-        stream.currentAmount = this.calculateNextBetAmount(stream);
+        stream.currentAmount = await this.calculateNextBetAmount(stream);
 
         // Логирование информации о следующей ставке
         this.sendTelegramMessage(
