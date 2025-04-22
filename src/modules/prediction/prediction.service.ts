@@ -188,11 +188,14 @@ export class PredictionService implements OnModuleInit {
       if (!privateKey?.startsWith('0x')) {
         throw new Error('Invalid private key format. Must start with 0x');
       }
+      const BSC_RPC_URL = this.config.getOrThrow('BSC_RPC_URL');
+      this.logger.log('Initializing Web3 provider...');
+      this.logger.log(`Current BSC_RPC_URL: `, BSC_RPC_URL);
 
-      this.provider = new ethers.JsonRpcProvider(
-        this.config.get('BSC_RPC_URL') || 'https://bsc-dataseed.bnbchain.org/',
-        { name: 'binance', chainId: 56 },
-      );
+      this.provider = new ethers.JsonRpcProvider(BSC_RPC_URL, {
+        name: 'binance',
+        chainId: 56,
+      });
 
       this.wallet = new ethers.Wallet(privateKey, this.provider);
 
