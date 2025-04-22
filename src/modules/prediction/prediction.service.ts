@@ -190,7 +190,7 @@ export class PredictionService implements OnModuleInit {
       }
 
       this.provider = new ethers.JsonRpcProvider(
-        this.config.get('BSC_RPC_URL') || 'https://bsc-dataseed.binance.org/',
+        this.config.get('BSC_RPC_URL') || 'https://bsc-dataseed.bnbchain.org/',
         { name: 'binance', chainId: 56 },
       );
 
