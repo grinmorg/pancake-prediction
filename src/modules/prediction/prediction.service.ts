@@ -343,17 +343,9 @@ export class PredictionService implements OnModuleInit {
       this.totalBankroll = await this.provider.getBalance(this.wallet.address);
 
       // Для стратегии с фиксированным процентом, используем процент от баланса
-      const rawAmount =
-        (this.totalBankroll *
-          BigInt(Math.floor(this.FIXED_PERCENTAGE * 10000))) /
-        10000n;
-
-      // Добавляем 1 к числу, если есть остаток от деления (это округлит вверх)
-      const remainder =
-        (this.totalBankroll *
-          BigInt(Math.floor(this.FIXED_PERCENTAGE * 10000))) %
-        10000n;
-      return remainder > 0n ? rawAmount + 1n : rawAmount;
+      return (
+        (this.totalBankroll * BigInt(this.FIXED_PERCENTAGE * 100)) / 10000n
+      );
     } else {
       // Для модифицированной мартингейл стратегии используем базовую ставку
       return this.baseBetAmount;
